@@ -20,6 +20,7 @@ from simple.robots.franka import FrankaMixin
 from simple.utils import resolve_res_path, resolve_data_path, load_yaml
 from simple.robots.protocols import Humanoid,HeadCamMountable
 from simple.robots.protocols import HasDexterousHand, Humanoid
+import os
 import numpy as np
 import transforms3d as t3d
 from typing import Tuple
@@ -119,25 +120,46 @@ class G1Wholebody(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
         super().__init__(self.uid, self.dof)
         self.joint_names = self.joints_names
         self.amo_policy = AMO_Policy(robot_type="g1_dex3_wholebody", device="cuda",joint_names=self.joint_names)
-
-        self.stiffness = np.array([
-                150, 150, 150, 300, 80, 20,
-                150, 150, 150, 300, 80, 20,
-                400, 400, 400,
-                80, 80, 40, 60,40,40,40,
-                80, 80, 40, 60,40,40,40,
+        pd_profile = os.environ.get("SIMPLE_G1_PD_PROFILE", "default").strip().lower()
+        if pd_profile == "soft":
+            # Match TextOpTracker/scripts/deploy_mujoco.py PD gains.
+            self.stiffness = np.array([
+                40.17923847137318, 99.09842777666113, 40.17923847137318, 99.09842777666113, 28.50124619574858, 28.50124619574858,
+                40.17923847137318, 99.09842777666113, 40.17923847137318, 99.09842777666113, 28.50124619574858, 28.50124619574858,
+                40.17923847137318, 28.50124619574858, 28.50124619574858,
+                14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 16.77832748089279, 16.77832748089279,
+                14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 16.77832748089279, 16.77832748089279,
                 80, 40, 40, 60, 40, 40, 40,
-                80, 40, 40, 60, 40, 40, 40, 
-            ])
-        self.damping = np.array([
-                2, 2, 2, 4, 2, 1,
-                2, 2, 2, 4, 2, 1,
-                15, 15, 15,
-                2, 2, 1, 1, 1, 1, 1,
-                2, 2, 1, 1, 1, 1, 1,
+                80, 40, 40, 60, 40, 40, 40,
+            ], dtype=np.float32)
+            self.damping = np.array([
+                2.5578897650279457, 6.3088018534966395, 2.5578897650279457, 6.3088018534966395, 1.814445686584846, 1.814445686584846,
+                2.5578897650279457, 6.3088018534966395, 2.5578897650279457, 6.3088018534966395, 1.814445686584846, 1.814445686584846,
+                2.5578897650279457, 1.814445686584846, 1.814445686584846,
+                0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 1.06814150219, 1.06814150219,
+                0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 1.06814150219, 1.06814150219,
                 1, 1, 1, 1, 1, 1, 1,
                 1, 1, 1, 1, 1, 1, 1,
-            ])
+            ], dtype=np.float32)
+        else:
+            self.stiffness = np.array([
+                    150, 150, 150, 300, 80, 20,
+                    150, 150, 150, 300, 80, 20,
+                    400, 400, 400,
+                    80, 80, 40, 60,40,40,40,
+                    80, 80, 40, 60,40,40,40,
+                    80, 40, 40, 60, 40, 40, 40,
+                    80, 40, 40, 60, 40, 40, 40, 
+                ], dtype=np.float32)
+            self.damping = np.array([
+                    2, 2, 2, 4, 2, 1,
+                    2, 2, 2, 4, 2, 1,
+                    15, 15, 15,
+                    2, 2, 1, 1, 1, 1, 1,
+                    2, 2, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1,
+                ], dtype=np.float32)
         self.torque_limits = np.array([
                 88, 139, 88, 139, 50, 50,
                 88, 139, 88, 139, 50, 50,

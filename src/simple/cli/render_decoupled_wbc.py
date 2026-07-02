@@ -28,6 +28,7 @@ import time
 import typer
 import mujoco
 import numpy as np
+import imageio.v3 as iio
 import gymnasium as gym
 from pathlib import Path
 from typing_extensions import Annotated, TYPE_CHECKING
@@ -188,6 +189,9 @@ def main(
     render_hz: Annotated[int, typer.Option()] = 30,
     num_episodes: Annotated[int, typer.Option()] = -1,
     record: Annotated[bool, typer.Option()] = False,
+    mp4_only: Annotated[bool, typer.Option("--mp4-only/--no-mp4-only")] = False,
+    fullbody_camera: Annotated[bool, typer.Option("--fullbody-camera/--no-fullbody-camera")] = False,
+    replay_object_poses: Annotated[bool, typer.Option("--replay-object-poses/--initial-objects")] = True,
     save_dir: Annotated[str, typer.Option()] = "data/render_decoupled_wbc",
     dr_level: Annotated[int, typer.Option()] = 0,
 ):
@@ -248,6 +252,31 @@ def main(
     mujoco_sim = sonic_env.mujoco
     isaac_sim = sonic_env.isaac
     robot = sonic_env.task.robot
+    if fullbody_camera:
+        from simple.sensors import CameraCfg
+
+        sonic_env.task.sensor_cfgs["debug_fullbody"] = CameraCfg(
+            uid="Debug_Fullbody",
+            mount="eye_on_base",
+            width=640,
+            height=360,
+            focal_length=1.88,
+            fov=np.deg2rad(75),
+            near=0.2,
+            far=20,
+            pose=dict(
+                position=[1.55, -1.2, 1.8],
+                eulers=np.deg2rad([0, 25, 145]),
+            ),
+        )
+        if isinstance(sonic_env.observation_space, gym.spaces.Dict):
+            spaces = dict(sonic_env.observation_space.spaces)
+            spaces["debug_fullbody"] = gym.spaces.Box(
+                0, 255, shape=(360, 640, 3), dtype=np.uint8
+            )
+            sonic_env.observation_space = gym.spaces.Dict(spaces)
+            env.observation_space = sonic_env.observation_space
+        print("[MP4] Added debug_fullbody camera")
 
     frame_dt = 1.0 / dataset_fps
 
@@ -296,9 +325,41 @@ def main(
                 print(f"[Record] Exporter initialized, saving to {save_dir}")
                 print(f"[Record] Recording {len(obj_names_labels)} objects: {obj_names_labels}")
 
-            # Dataset joint names for mapping observation.state → MuJoCo joints
-            # dataset_joint_names = features["observation.state"]["names"]
-            dataset_joint_names = dataset_info["features"]["observation.state"]["names"]
+            rendered_frames_by_key: dict[str, list[np.ndarray]] = {}
+
+            # Dataset joint names for mapping recorded joint state to MuJoCo joints.
+            # Decoupled_wbc exports use `observation.state` with per-joint names.
+            # Older Psi0 exports may only have `states`, so prefer their split
+            # joint observations when available.
+            split_state_keys = (
+                "observation.leg_joints",
+                "observation.arm_joints",
+                "observation.hand_joints",
+            )
+            use_split_state = all(key in features for key in split_state_keys)
+            state_key = "observation.state" if "observation.state" in features else "states"
+            if use_split_state:
+                from simple.robots.g1_sonic import (
+                    LEFT_LEG_JOINTS,
+                    RIGHT_LEFT_JOINTS,
+                    WAIST_JOINTS,
+                    LEFT_ARM_JOINTS,
+                    RIGHT_ARM_JOINTS,
+                    LEFT_HAND_JOINTS,
+                    RIGHT_HAND_JOINTS,
+                )
+
+                dataset_joint_names = (
+                    LEFT_LEG_JOINTS
+                    + RIGHT_LEFT_JOINTS
+                    + WAIST_JOINTS
+                    + LEFT_ARM_JOINTS
+                    + RIGHT_ARM_JOINTS
+                    + LEFT_HAND_JOINTS
+                    + RIGHT_HAND_JOINTS
+                )
+            else:
+                dataset_joint_names = dataset_info["features"][state_key]["names"]
 
             for frame_idx in tqdm(range(num_frames), desc=f"Frames (Ep {ep_idx})", leave=False, unit="frame"):
                 if not record:
@@ -315,8 +376,17 @@ def main(
                     base_vel = np.array(row["observation.base_vel"])
                     mujoco_sim.mjData.qvel[:6] = base_vel
 
-                # --- Set robot joint positions from observation.state ---
-                obs_state = np.array(row["observation.state"])
+                # --- Set robot joint positions from recorded state ---
+                if use_split_state:
+                    obs_state = np.concatenate(
+                        [
+                            np.array(row["observation.leg_joints"]),
+                            np.array(row["observation.arm_joints"]),
+                            np.array(row["observation.hand_joints"]),
+                        ]
+                    )
+                else:
+                    obs_state = np.array(row[state_key])
                 for jname, jval in zip(dataset_joint_names, obs_state):
                     if jname in mujoco_sim.joints:
                         mujoco_sim.joints[jname].qpos = jval
@@ -324,7 +394,7 @@ def main(
                 # --- Set object poses ---
                 # Note: If env_conf was used for reset, object poses are already correct.
                 # Only set object poses from dataset if env_conf was NOT used.
-                if has_object_poses and num_objects > 0:
+                if replay_object_poses and has_object_poses and num_objects > 0:
                     obj_poses_flat = np.array(row["observation.object_poses"])
                     obj_positions = []
                     obj_orientations = []
@@ -342,11 +412,17 @@ def main(
                     isaac_sim.step(mujoco_sim)
 
                 # --- Record frame ---
-                if exporter is not None and isaac_sim is not None:
+                if isaac_sim is not None and (exporter is not None or mp4_only):
                     rendered = isaac_sim.render()
                     isaac_image = rendered["head_stereo_left"]
-                    frame = _build_replay_frame(row, isaac_image, features)
-                    exporter.add_frame(frame)
+                    if mp4_only:
+                        for image_key, image in rendered.items():
+                            arr = np.asarray(image)
+                            if arr.ndim >= 3:
+                                rendered_frames_by_key.setdefault(image_key, []).append(arr)
+                    if exporter is not None:
+                        frame = _build_replay_frame(row, isaac_image, features)
+                        exporter.add_frame(frame)
 
                 # Pace to dataset fps (skip when recording for speed)
                 if not record:
@@ -362,6 +438,26 @@ def main(
                     _save_replay_episode_env_config(exporter, env_conf, episodes_saved) 
                 episodes_saved += 1
                 print(f"[Record] Episode {episodes_saved} saved")
+
+            if mp4_only and rendered_frames_by_key:
+                for image_key, rendered_frames in rendered_frames_by_key.items():
+                    video_dir = (
+                        Path(save_dir)
+                        / sonic_env.spec.id
+                        / f"level-{dr_level}"
+                        / "videos"
+                        / "chunk-000"
+                        / f"observation.images.{image_key}"
+                    )
+                    video_dir.mkdir(parents=True, exist_ok=True)
+                    mp4_path = video_dir / f"episode_{ep_idx:06d}.mp4"
+                    iio.imwrite(
+                        mp4_path,
+                        np.stack(rendered_frames),
+                        fps=dataset_fps,
+                        codec="libx264",
+                    )
+                    print(f"[MP4] Episode {ep_idx} {image_key} saved to {mp4_path}")
 
             print(f"[Replay] Episode {ep_idx} done")
 

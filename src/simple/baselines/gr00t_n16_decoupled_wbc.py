@@ -5,6 +5,7 @@ Copyright (c) 2025 Songlin Wei and Contributors
 Licensed under the terms in LICENSE file.
 """
 
+import os
 import time
 
 import numpy as np
@@ -97,7 +98,16 @@ class Gr00tN16DecoupledWbcAgent(SonicDecoupledWbcAgent):
                 dataset="simple",
             )
             print(f"Received {pred_action.shape[0]} actions from server.")
-            for i in range(pred_action.shape[0]):
+            execution_horizon = min(
+                pred_action.shape[0],
+                int(os.environ.get("GR00T_EXECUTION_HORIZON", pred_action.shape[0])),
+            )
+            if execution_horizon <= 0:
+                raise ValueError(
+                    f"GR00T_EXECUTION_HORIZON must be positive, got {execution_horizon}"
+                )
+            print(f"Queueing {execution_horizon} actions before replanning.")
+            for i in range(execution_horizon):
                 for _ in range(
                     self.upsample_factor
                 ):  # account for upsampling during training
@@ -185,4 +195,3 @@ class Gr00tN16DecoupledWbcAgent(SonicDecoupledWbcAgent):
         self._last_pred_action = None
         self._reset_history = True
         self._last_cmd_torso_rpyh = np.array([0, 0, 0, 0.74])
-

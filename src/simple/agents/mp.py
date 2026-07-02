@@ -373,6 +373,9 @@ class MotionPlannerAgent(PrimitiveAgent):
                     
                 except Exception as e:
                     print(f"Planning failed with error: {e}")
+                    if self.debug:
+                        import traceback
+                        traceback.print_exc()
                     # raise e
                     return False
                 

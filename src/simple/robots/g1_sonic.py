@@ -8,6 +8,7 @@ Licensed under the terms in LICENSE file.
 import os
 import numpy as np
 import mujoco
+import transforms3d as t3d
 import xml.etree.ElementTree as ET
 from typing import Any, List, Dict, Tuple
 from threading import Lock, Thread
@@ -61,7 +62,7 @@ class G1Sonic(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
     hand_uid: str = "dex3_right" # FIXME
     hand_dof: int = 7  # FIXME
 
-    # pregrasp_distance: List[float] = [0.05, 0.08]
+    pregrasp_distance: List[float] = [0.05, 0.08]
 
     wrist_camera_orientation: List[float] =[ 1,0,0,0]
     head_camera_orientation: List[float] =[ 1,0,0,0]
@@ -160,6 +161,70 @@ class G1Sonic(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
         self.spawn_pose = kwargs["spawn_pose"]
         self._stabilized = False
         self._stabilize_step_count = 0
+
+    def update_ee_link(self, hand_uid):
+        """Switch cuRobo planning links to the requested dexterous hand.
+
+        MotionPlannerAgent calls this on Humanoid robots before planning grasp
+        phases.  G1Sonic uses the same cuRobo config as the whole-body G1 path,
+        so keep this mapping aligned with G1Wholebody.
+        """
+        if "left" in hand_uid:
+            ee_link = self.LEFT_ARM_EE_LINK
+            link_names = [
+                "waist_yaw_link", "waist_roll_link", "torso_link",
+                "left_hand_palm_link", "left_hand_index_1_link", "left_hand_middle_1_link", "left_hand_thumb_2_link",
+                "right_hand_palm_link", "right_hand_index_1_link", "right_hand_middle_1_link", "right_hand_thumb_2_link",
+            ]
+            collision_link_names = [
+                "left_shoulder_pitch_link", "left_shoulder_roll_link", "left_shoulder_yaw_link", "left_elbow_link", "left_wrist_pitch_link", "torso_link",
+                "right_shoulder_pitch_link", "right_shoulder_roll_link", "right_shoulder_yaw_link", "right_elbow_link", "right_wrist_pitch_link",
+                "left_hand_palm_link", "left_hand_thumb_0_link", "left_hand_thumb_1_link", "left_hand_thumb_2_link", "left_hand_middle_0_link", "left_hand_middle_1_link", "left_hand_index_0_link", "left_hand_index_1_link",
+            ]
+        else:
+            ee_link = self.RIGHT_ARM_EE_LINK
+            link_names = [
+                "waist_yaw_link", "waist_roll_link", "torso_link",
+                "right_hand_palm_link", "right_hand_index_1_link", "right_hand_middle_1_link", "right_hand_thumb_2_link",
+                "left_hand_palm_link", "left_hand_index_1_link", "left_hand_middle_1_link", "left_hand_thumb_2_link",
+            ]
+            collision_link_names = [
+                "left_shoulder_pitch_link", "left_shoulder_roll_link", "left_shoulder_yaw_link", "left_elbow_link", "left_wrist_pitch_link", "torso_link",
+                "right_shoulder_pitch_link", "right_shoulder_roll_link", "right_shoulder_yaw_link", "right_elbow_link", "right_wrist_pitch_link",
+                "right_hand_palm_link", "right_hand_thumb_0_link", "right_hand_thumb_1_link", "right_hand_thumb_2_link", "right_hand_middle_0_link", "right_hand_middle_1_link", "right_hand_index_0_link", "right_hand_index_1_link",
+            ]
+
+        self.robot_cfg["kinematics"]["ee_link"] = ee_link
+        self.robot_cfg["kinematics"]["link_names"] = link_names
+        self.robot_cfg["kinematics"]["collision_link_names"] = collision_link_names
+        self.hand_yaml = f"robots/g1/curobo/{hand_uid}.yml"
+        print(f'now the ee_link is {self.robot_cfg["kinematics"]["ee_link"]}')
+
+    def get_grasp_pose_wrt_robot(self, grasp_info: dict, pregrasp: bool = False, robot_pose=None):
+        assert robot_pose is not None, "not implemented"
+
+        T_ee_hand = np.eye(4, dtype=np.float32)
+        T_ee_hand[:3, 3] = np.array([0, 0, -self.robot_eef_offset], dtype=np.float32)
+
+        T_grasp_ee = np.eye(4, dtype=np.float32)
+        R_world_grasp = t3d.quaternions.quat2mat(grasp_info["orientation"])
+        T_world_grasp = np.eye(4, dtype=np.float32)
+        T_world_grasp[:3, 3] = grasp_info["position"] + grasp_info["depth"] * R_world_grasp[:, 0]
+        T_world_grasp[:3, :3] = R_world_grasp
+
+        if pregrasp:
+            T_grasp_pregrasp = np.eye(4, dtype=np.float32)
+            T_grasp_pregrasp[0, 3] = -np.random.uniform(
+                self.pregrasp_distance[0],
+                self.pregrasp_distance[1],
+            )
+            T_robot_hand = np.linalg.inv(robot_pose) @ T_world_grasp @ T_grasp_pregrasp @ T_grasp_ee @ T_ee_hand
+        else:
+            T_robot_hand = np.linalg.inv(robot_pose) @ T_world_grasp @ T_grasp_ee @ T_ee_hand
+
+        grasp_pos_in_robot = T_robot_hand[:3, 3]
+        grasp_ori_in_robot = t3d.quaternions.mat2quat(T_robot_hand[:3, :3])
+        return grasp_pos_in_robot, grasp_ori_in_robot
 
     @property
     def stabilized(self) -> bool:
@@ -440,6 +505,57 @@ class G1Sonic(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
 
                 self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
 
+                if self.sonic_config["FREE_BASE"]:
+                    self.mjData.ctrl = np.concatenate((np.zeros(6), self.torques))
+                else:
+                    self.mjData.ctrl = self.torques
+
+            case "textop_tracker":
+                target_q = action_cmd["target_q"]
+                kp = np.array([
+                    40.17923847137318, 99.09842777666113, 40.17923847137318,
+                    99.09842777666113, 28.50124619574858, 28.50124619574858,
+                    40.17923847137318, 99.09842777666113, 40.17923847137318,
+                    99.09842777666113, 28.50124619574858, 28.50124619574858,
+                    40.17923847137318, 28.50124619574858, 28.50124619574858,
+                    14.25062309787429, 14.25062309787429, 14.25062309787429,
+                    14.25062309787429, 14.25062309787429, 16.77832748089279,
+                    16.77832748089279, 14.25062309787429, 14.25062309787429,
+                    14.25062309787429, 14.25062309787429, 14.25062309787429,
+                    16.77832748089279, 16.77832748089279,
+                ], dtype=float)
+                kd = np.array([
+                    2.5578897650279457, 6.3088018534966395, 2.5578897650279457,
+                    6.3088018534966395, 1.814445686584846, 1.814445686584846,
+                    2.5578897650279457, 6.3088018534966395, 2.5578897650279457,
+                    6.3088018534966395, 1.814445686584846, 1.814445686584846,
+                    2.5578897650279457, 1.814445686584846, 1.814445686584846,
+                    0.907222843423, 0.907222843423, 0.907222843423,
+                    0.907222843423, 0.907222843423, 1.06814150219,
+                    1.06814150219, 0.907222843423, 0.907222843423,
+                    0.907222843423, 0.907222843423, 0.907222843423,
+                    1.06814150219, 1.06814150219,
+                ], dtype=float)
+
+                q_cur = self.mjData.qpos[self.body_joint_index + self.qpos_offset - 1]
+                dq_cur = self.mjData.qvel[self.body_joint_index + self.qvel_offset - 1]
+                self.torques[self.body_joint_index - 1] = kp * (target_q - q_cur) + kd * (0 - dq_cur)
+
+                if self.num_hand_dof > 0:
+                    left_hand_q = action_cmd["left_hand_q"]
+                    right_hand_q = action_cmd["right_hand_q"]
+                    hand_kp = np.array([5.0, 5.0, 5.0, 2.5, 2.5, 2.5, 2.5])
+                    hand_kd = 1.0
+                    if left_hand_q is not None:
+                        lh_q_cur = self.mjData.qpos[self.left_hand_index + self.qpos_offset - 1]
+                        lh_dq_cur = self.mjData.qvel[self.left_hand_index + self.qvel_offset - 1]
+                        self.torques[self.left_hand_index - 1] = hand_kp * (left_hand_q - lh_q_cur) + hand_kd * (0 - lh_dq_cur)
+                    if right_hand_q is not None:
+                        rh_q_cur = self.mjData.qpos[self.right_hand_index + self.qpos_offset - 1]
+                        rh_dq_cur = self.mjData.qvel[self.right_hand_index + self.qvel_offset - 1]
+                        self.torques[self.right_hand_index - 1] = hand_kp * (right_hand_q - rh_q_cur) + hand_kd * (0 - rh_dq_cur)
+
+                self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
                 if self.sonic_config["FREE_BASE"]:
                     self.mjData.ctrl = np.concatenate((np.zeros(6), self.torques))
                 else:

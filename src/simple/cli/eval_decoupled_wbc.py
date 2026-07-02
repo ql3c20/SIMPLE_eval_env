@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import multiprocessing as mp
 import os
 from collections import defaultdict
@@ -47,6 +48,41 @@ def _append_eval_stats_line(eval_dir: str, line: str) -> None:
         f.write(line)
         f.flush()
         os.fsync(f.fileno())
+
+
+def _root_roll_pitch_from_wxyz(quat) -> tuple[float, float]:
+    w, x, y, z = [float(v) for v in quat]
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    if norm <= 0.0:
+        return 0.0, 0.0
+    w, x, y, z = w / norm, x / norm, y / norm, z / norm
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+    sinp = 2.0 * (w * y - z * x)
+    pitch = math.copysign(math.pi / 2.0, sinp) if abs(sinp) >= 1.0 else math.asin(sinp)
+    return roll, pitch
+
+
+def _fall_stop_triggered(robot: Any) -> tuple[bool, str]:
+    if os.environ.get("FALL_STOP", "0") != "1":
+        return False, ""
+    qpos = getattr(getattr(robot, "mjData", None), "qpos", None)
+    if qpos is None or len(qpos) < 7:
+        return False, ""
+
+    min_root_z = float(os.environ.get("FALL_MIN_ROOT_Z", "0.45"))
+    max_abs_rp = float(os.environ.get("FALL_MAX_ABS_RP", "0.9"))
+    root_z = float(qpos[2])
+    roll, pitch = _root_roll_pitch_from_wxyz(qpos[3:7])
+    if root_z < min_root_z:
+        return True, f"root_z={root_z:.3f} < {min_root_z:.3f}"
+    if abs(roll) > max_abs_rp or abs(pitch) > max_abs_rp:
+        return True, (
+            f"abs(roll/pitch)=({abs(roll):.3f},{abs(pitch):.3f}) "
+            f"> {max_abs_rp:.3f}"
+        )
+    return False, ""
 
 
 @contextmanager
@@ -292,19 +328,20 @@ def _run_eval_worker(
 
         # --- Wait for robot to stabilize (velocity-based) ---
         sim_cnt = 0
-        while not robot.stabilized and sim_cnt < 300:
-            step_start = time.monotonic()
-            action = agent.get_stabilize_action(observation)
-            observation, *_, info = env.step(action)
+        if os.environ.get("SKIP_STABILIZE", "0") != "1":
+            while not robot.stabilized and sim_cnt < 300:
+                step_start = time.monotonic()
+                action = agent.get_stabilize_action(observation)
+                observation, *_, info = env.step(action)
 
-            sonic_env.update_viewer()
-            sonic_env.update_reward()
+                sonic_env.update_viewer()
+                sonic_env.update_reward()
 
-            elapsed = time.monotonic() - step_start
-            sleep_time = control_dt - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            sim_cnt += 1
+                elapsed = time.monotonic() - step_start
+                sleep_time = control_dt - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                sim_cnt += 1
 
         frame_idx = 0
         episode_start_time = time.perf_counter()
@@ -329,6 +366,7 @@ def _run_eval_worker(
 
         agent.reset(**reset_kwargs)
         episode_over = False
+        fall_stop_reason = ""
         while not episode_over:
             try:
                 action = agent.get_action(
@@ -337,6 +375,10 @@ def _run_eval_worker(
                 observation, reward, terminated, truncated, info = env.step(action)
                 episode_over = terminated or truncated
                 frame_idx += 1
+                fall_stop, fall_stop_reason = _fall_stop_triggered(robot)
+                if fall_stop:
+                    episode_over = True
+                    print(f"[FallStop] {task_id} stopped at step {frame_idx}: {fall_stop_reason}")
                 if frame_idx == 1 or frame_idx % step_update_every == 0 or episode_over:
                     report("episode_step", episode=task_id, step=frame_idx)
             except StopIteration:
@@ -344,9 +386,12 @@ def _run_eval_worker(
                 print("Episode finished.")
 
         is_success = raw_env.unwrapped._success  # type: ignore[attr-defined]
+        if fall_stop_reason:
+            is_success = False
         stats[task_id] = is_success
         episode_seconds = time.perf_counter() - episode_start_time
-        _append_eval_stats_line(eval_dir, f"{task_id}: {is_success} \n")
+        suffix = f" fall_stop={fall_stop_reason}" if fall_stop_reason else ""
+        _append_eval_stats_line(eval_dir, f"{task_id}: {is_success}{suffix} \n")
         report(
             "episode_end",
             episode=task_id,

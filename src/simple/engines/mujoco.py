@@ -60,6 +60,16 @@ class MujocoSimulator(Simulator):
         self._is_sonic = None
         self.articulated_object_joints = None
 
+    @property
+    def mj_physics_data(self):
+        """Backward-compatible alias for older task code."""
+        return self.mjData
+
+    @property
+    def mj_physics_model(self):
+        """Backward-compatible alias for older task code."""
+        return self.mjModel
+
     def update_layout(self, **kwargs) -> None:
         # FIXME
         self._is_sonic = ("sonic_config" in kwargs)

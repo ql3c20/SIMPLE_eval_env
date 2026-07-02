@@ -436,7 +436,9 @@ class IsaacSimSimulator(Simulator):
             isaacsim_camera = self.cameras[cname]
             # isaacsim_camera.set_local_pose(p, [q[-1], q[0], q[1], q[2]]) # wxyz
             isaacsim_camera.set_local_pose(p, q) # xyzw
-            isaacsim_camera.set_clipping_range(0.01, 10.0) # FIXME hardcoded
+            isaacsim_camera.set_clipping_range(
+                cameraEntity.cam_cfg.near, cameraEntity.cam_cfg.far
+            )
             isaacsim_camera.set_focal_length(cameraEntity.focal_length)
 
             horizontal_aperture = cameraEntity.focal_length * cameraEntity.resolution[0] / cameraEntity.fx

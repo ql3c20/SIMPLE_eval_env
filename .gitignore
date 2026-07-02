@@ -96,3 +96,6 @@ MUJOCO_LOG.TXT
 .venv-nix/
 .direnv
 .runtime-state/
+
+# Local Hugging Face cache
+huggingface/

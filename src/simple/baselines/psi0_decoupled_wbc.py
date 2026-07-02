@@ -6,6 +6,8 @@ Licensed under the terms in LICENSE file.
 """
 
 import time
+import os
+from pathlib import Path
 import numpy as np
 from simple.agents.sonic_decoupled_wbc_agent import SonicDecoupledWbcAgent
 from simple.core.action import ActionCmd
@@ -39,6 +41,13 @@ class Psi0DecoupledWbcAgent(SonicDecoupledWbcAgent):
 
         self.client = HttpActionClient(self.server_ip, self.server_port)
         self._global_step_idx = 0
+        self._episode_idx = -1
+        self._dump_qpos36_dir = os.environ.get("PSI0_DUMP_QPOS36_DIR", "")
+        self._dump_policy36_dir = os.environ.get("PSI0_DUMP_POLICY36_DIR", "")
+        self._executed_qpos36 = []
+        self._policy36_chunks = []
+        self._policy_action_queue = []
+        self._last_policy_action_raw = None
 
         # last command (high level input to lower policy)
         self._last_cmd_torso_rpyh = np.array([0, 0, 0, 0.74]) # FIXME hardcoded for g1 wholebody, need to be more general in the future
@@ -87,8 +96,10 @@ class Psi0DecoupledWbcAgent(SonicDecoupledWbcAgent):
                 dataset="simple",
             )
             print(f"Received {pred_action.shape[0]} actions from server.")
+            self._append_policy36(pred_action)
             for i in range(pred_action.shape[0]):
                 for _ in range(self.upsample_factor): # account for upsampling during training
+                    self._policy_action_queue.append(np.asarray(pred_action[i], dtype=np.float32).copy())
                     target_qpos = dict(
                         zip(
                             self.robot.joint_names[15:],
@@ -109,6 +120,10 @@ class Psi0DecoupledWbcAgent(SonicDecoupledWbcAgent):
 
         action_cmd = super().get_action(observation, instruction, **kwargs)
         if action_cmd.type == "vla_cmd":
+            if self._policy_action_queue:
+                self._last_policy_action_raw = self._policy_action_queue.pop(0)
+            else:
+                self._last_policy_action_raw = None
              
             proprio = self.robot.prepare_obs()
             wbc_obs = self._build_wbc_observation(proprio)
@@ -146,15 +161,57 @@ class Psi0DecoupledWbcAgent(SonicDecoupledWbcAgent):
             raise ValueError(f"Unexpected action type {action_cmd.type} from queue.")
 
         self._last_pred_action = action_cmd
+        self._append_executed_qpos36()
         self._global_step_idx += 1
         return action_cmd
+
+    def _episode_dir(self, root: str) -> Path:
+        path = Path(root) / f"ep{max(self._episode_idx, 0):04d}"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _current_qpos36(self) -> np.ndarray:
+        proprio = self.robot.prepare_obs()
+        root_pose = np.asarray(proprio.get("floating_base_pose", np.zeros(7)), dtype=np.float32).reshape(-1)
+        if root_pose.size < 7:
+            root_pose = np.asarray([0.0, 0.0, 0.74, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        body_q = np.asarray(proprio["body_q"], dtype=np.float32).reshape(-1)
+        if body_q.size != 29:
+            raise ValueError(f"Expected body_q to be 29D, got {body_q.shape}")
+        return np.concatenate([root_pose[:7], body_q], axis=0).astype(np.float32)
+
+    def _append_executed_qpos36(self) -> None:
+        if not self._dump_qpos36_dir:
+            return
+        self._executed_qpos36.append(self._current_qpos36())
+        out = np.asarray(self._executed_qpos36, dtype=np.float32)
+        ep_dir = self._episode_dir(self._dump_qpos36_dir)
+        np.savetxt(ep_dir / "executed_qpos36.csv", out, delimiter=",", fmt="%.8f")
+        np.savez(ep_dir / "executed_qpos36.qpos.npz", qpos=out, fps=float(self._control_frequency))
+
+    def _append_policy36(self, pred_action: np.ndarray) -> None:
+        if not self._dump_policy36_dir:
+            return
+        pred_action = np.asarray(pred_action, dtype=np.float32)
+        if pred_action.ndim != 2 or pred_action.shape[1] != 36:
+            return
+        self._policy36_chunks.append(pred_action.copy())
+        out = np.concatenate(self._policy36_chunks, axis=0)
+        ep_dir = self._episode_dir(self._dump_policy36_dir)
+        np.savetxt(ep_dir / "policy36_chunks.csv", out, delimiter=",", fmt="%.8f")
+        np.savez(ep_dir / "policy36_chunks.npz", action=out, fps=float(self._control_frequency))
     
     def reset(self, **kwargs):
         super().reset(**kwargs)  # clear queue
 
+        self._episode_idx += 1
         self._global_step_idx = 0
         self._last_qpos = None
         self._last_observation = None
         self._last_pred_action = None
         self._reset_history = True
         self._last_cmd_torso_rpyh = np.array([0, 0, 0, 0.74])
+        self._executed_qpos36 = []
+        self._policy36_chunks = []
+        self._policy_action_queue = []
+        self._last_policy_action_raw = None
