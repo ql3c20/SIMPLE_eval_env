@@ -510,6 +510,62 @@ class G1Sonic(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
                 else:
                     self.mjData.ctrl = self.torques
 
+            case "sonic_decoder":
+                target_q = action_cmd["target_q"]
+                # Exact gains from SONIC_my gear_sonic_deploy
+                # g1_deploy_onnx_ref/include/policy_parameters.hpp.
+                kp = np.array([
+                    99.0984277767, 99.0984277767, 40.1792384714,
+                    99.0984277767, 28.5012461957, 28.5012461957,
+                    99.0984277767, 99.0984277767, 40.1792384714,
+                    99.0984277767, 28.5012461957, 28.5012461957,
+                    40.1792384714, 28.5012461957, 28.5012461957,
+                    14.2506230979, 14.2506230979, 14.2506230979,
+                    14.2506230979, 14.2506230979, 16.7783274809,
+                    16.7783274809, 14.2506230979, 14.2506230979,
+                    14.2506230979, 14.2506230979, 14.2506230979,
+                    16.7783274809, 16.7783274809,
+                ], dtype=float)
+                kd = np.array([
+                    6.3088018535, 6.3088018535, 2.5578897650,
+                    6.3088018535, 1.8144456860, 1.8144456860,
+                    6.3088018535, 6.3088018535, 2.5578897650,
+                    6.3088018535, 1.8144456860, 1.8144456860,
+                    2.5578897650, 1.8144456860, 1.8144456860,
+                    0.9072228434, 0.9072228434, 0.9072228434,
+                    0.9072228434, 0.9072228434, 1.0681415022,
+                    1.0681415022, 0.9072228434, 0.9072228434,
+                    0.9072228434, 0.9072228434, 0.9072228434,
+                    1.0681415022, 1.0681415022,
+                ], dtype=float)
+                q_cur = self.mjData.qpos[self.body_joint_index + self.qpos_offset - 1]
+                dq_cur = self.mjData.qvel[self.body_joint_index + self.qvel_offset - 1]
+                self.torques[self.body_joint_index - 1] = (
+                    kp * (target_q - q_cur) - kd * dq_cur
+                )
+
+                if self.num_hand_dof > 0:
+                    hand_kp = np.array([5.0, 5.0, 5.0, 2.5, 2.5, 2.5, 2.5])
+                    hand_kd = 1.0
+                    for values, indices in (
+                        (action_cmd["left_hand_q"], self.left_hand_index),
+                        (action_cmd["right_hand_q"], self.right_hand_index),
+                    ):
+                        if values is not None:
+                            q_hand = self.mjData.qpos[indices + self.qpos_offset - 1]
+                            dq_hand = self.mjData.qvel[indices + self.qvel_offset - 1]
+                            self.torques[indices - 1] = (
+                                hand_kp * (values - q_hand) - hand_kd * dq_hand
+                            )
+
+                self.torques = np.clip(
+                    self.torques, -self.torque_limit, self.torque_limit
+                )
+                if self.sonic_config["FREE_BASE"]:
+                    self.mjData.ctrl = np.concatenate((np.zeros(6), self.torques))
+                else:
+                    self.mjData.ctrl = self.torques
+
             case "textop_tracker":
                 target_q = action_cmd["target_q"]
                 kp = np.array([

@@ -254,6 +254,15 @@ def _run_eval_worker(
 
         def get_episode(dataset_obj, idx):
             return get_episode_lerobot(dataset_obj, idx)
+    elif data_format == "fixed":
+        # Deterministic task-owned initialization; no recorded eval dataset is
+        # needed.  The task reset() constructs the scene for every episode.
+        dataset = [None] * num_episodes
+        dataset_size = num_episodes
+        render_hz = 50
+
+        def get_episode(dataset_obj, idx):
+            return None, []
     else:
         raise NotImplementedError(f"Data format {data_format} not supported YET.")
 
@@ -323,8 +332,15 @@ def _run_eval_worker(
 
         observation, info = env.reset(options={"state_dict": env_conf})
 
+        reset_before_stabilize = bool(
+            getattr(agent, "reset_before_stabilize", False)
+        )
+        if reset_before_stabilize:
+            agent.reset()
+
         # engage RL policy immediately
-        agent._wbc_policy.lower_body_policy.use_policy_action = True
+        if hasattr(agent, "_wbc_policy"):
+            agent._wbc_policy.lower_body_policy.use_policy_action = True
 
         # --- Wait for robot to stabilize (velocity-based) ---
         sim_cnt = 0
@@ -350,9 +366,10 @@ def _run_eval_worker(
         print(
             f"Robot stabilized after {sim_cnt} simulation steps. Engaging Policy Now!"
         )
-        agent._wbc_policy.lower_body_policy.gait_indices = torch.zeros(
-            (1), dtype=torch.float32
-        )
+        if hasattr(agent, "_wbc_policy"):
+            agent._wbc_policy.lower_body_policy.gait_indices = torch.zeros(
+                (1), dtype=torch.float32
+            )
 
         if policy == "vlt":
             reset_kwargs = {
@@ -364,7 +381,8 @@ def _run_eval_worker(
         else:
             reset_kwargs = {}
 
-        agent.reset(**reset_kwargs)
+        if not reset_before_stabilize:
+            agent.reset(**reset_kwargs)
         episode_over = False
         fall_stop_reason = ""
         while not episode_over:
@@ -518,8 +536,6 @@ def run_eval(
                     )
             finally:
                 restore_cursor(console)
-                if terminal_stream is not None:
-                    terminal_stream.close()
         else:
             stats = _run_eval_worker(
                 **worker_kwargs,
@@ -669,6 +685,8 @@ def run_eval(
     console.print(f"Eval log: {log_path}")
 
     _append_eval_stats_line(eval_dir, f"success rate: {sr:.2f} \n")
+    if terminal_stream is not None:
+        terminal_stream.close()
     return EvalResult(
         env_id=env_id,
         policy=policy,

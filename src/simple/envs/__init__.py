@@ -403,6 +403,12 @@ register(
 )
 
 register(
+    id="simple/G1Fullstate20260615Task1-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_20260615_task1"},
+)
+
+register(
     id="simple/G1WholebodyXMoveBendPickTeleop-v0",
     entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
     kwargs={"task":"g1_wholebody_xmove_bend_pick_teleop"},

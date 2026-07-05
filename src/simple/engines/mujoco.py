@@ -95,8 +95,13 @@ class MujocoSimulator(Simulator):
         # updata self.task.layout.objects pose, at beginning few steps don't update
         if self.render_step > 5:
             for objtype , mj_obj in self.mj_objects.items():
-                self.task.layout.actors[objtype].pose.position = list(mj_obj.xpos)
-                self.task.layout.actors[objtype].pose.quaternion = list(mj_obj.xquat)
+                # Task-owned MJCF bodies (for example fixed local evaluation
+                # scenes) are exposed in mj_objects without requiring a
+                # duplicate SIMPLE ObjectActor.
+                actor = self.task.layout.actors.get(objtype)
+                if actor is not None:
+                    actor.pose.position = list(mj_obj.xpos)
+                    actor.pose.quaternion = list(mj_obj.xquat)
             self.task.layout.actors["robot"].pose.position = list(np.round(self.mjData.qpos[:3], 3))
             self.task.layout.actors["robot"].pose.quaternion = list(np.round(self.mjData.qpos[3:7], 3))
 
@@ -174,6 +179,39 @@ class MujocoSimulator(Simulator):
                 self._build_articulated_object(mjSpec, mj_worldbody, actor)
             else:
                 raise TypeError(f"Unsupported actor type: {type(actor)}")
+
+        # Optional task-owned MJCF fragment.  This is useful for fixed local
+        # evaluation scenes whose geometry is already authored as MJCF and
+        # does not need an Isaac/asset-manager counterpart.
+        extra_scene_path = getattr(self.task, "mujoco_scene_mjcf_path", None)
+        if extra_scene_path:
+            extra_scene = mujoco.MjSpec.from_file(str(extra_scene_path))
+            extra_frame = mj_worldbody.add_frame()
+            mjSpec.attach(extra_scene, frame=extra_frame)
+
+        for extra in getattr(self.task, "mujoco_extra_mjcf", []):
+            child = mujoco.MjSpec.from_file(str(extra["path"]))
+            freejoint_body = extra.get("freejoint_body")
+            if freejoint_body:
+                body = next(
+                    (item for item in child.worldbody.find_all("body") if item.name == freejoint_body),
+                    None,
+                )
+                if body is None:
+                    raise ValueError(
+                        f"MJCF {extra['path']} has no body named {freejoint_body!r}"
+                    )
+                body.add_freejoint(name=extra.get("freejoint_name", "freejoint"))
+            frame = mj_worldbody.add_frame(
+                pos=extra.get("pos", [0.0, 0.0, 0.0]),
+                quat=extra.get("quat", [1.0, 0.0, 0.0, 0.0]),
+            )
+            mjSpec.attach(
+                child,
+                prefix=extra.get("prefix"),
+                suffix=extra.get("suffix"),
+                frame=frame,
+            )
             
         self.mj_worldbody = mj_worldbody
 
@@ -197,7 +235,11 @@ class MujocoSimulator(Simulator):
             material="groundplane"
         )
         # add some friction for contact stability
-        ground.friction = [1.0, 0.005, 0.0001]  # [sliding, torsional, rolling]
+        ground.friction = getattr(
+            self.task,
+            "mujoco_ground_friction",
+            [1.0, 0.005, 0.0001],
+        )  # [sliding, torsional, rolling]
 
         # 5. disable gravity (for better PID control of arms)
         self.mjModel=mjSpec.compile()
@@ -238,6 +280,12 @@ class MujocoSimulator(Simulator):
                 mj_objects[objtype] = mj_obj
                 obj_names.append(label)
 
+        # Fixed-scene tasks can expose selected MJCF bodies through the same
+        # info dictionary used by regular SIMPLE ObjectActors.
+        for objtype, body_name in getattr(self.task, "mujoco_object_body_names", {}).items():
+            mj_objects[objtype] = self.mjData.body(body_name)
+            obj_names.append(body_name)
+
         self.mj_objects = mj_objects
         self.obj_names = obj_names
 
@@ -247,6 +295,17 @@ class MujocoSimulator(Simulator):
         # 6. setup control
         assert isinstance(self.task.robot, Controllable), "Task robot is None."
         self.joints, self.actuators=self.task.robot.setup_control(self.mjData, self.mjModel, mjSpec=self.mjSpec)
+
+        initial_qpos = getattr(self.task, "mujoco_initial_robot_qpos", None)
+        if initial_qpos is not None:
+            initial_qpos = np.asarray(initial_qpos, dtype=np.float64).reshape(-1)
+            if initial_qpos.size > self.mjData.qpos.size:
+                raise ValueError(
+                    f"Task initial robot qpos has {initial_qpos.size} values, "
+                    f"but model nq={self.mjData.qpos.size}"
+                )
+            self.mjData.qpos[: initial_qpos.size] = initial_qpos
+            self.mjData.qvel[:] = 0.0
         
         
         if self.articulated_object_joints is not None:
@@ -416,6 +475,38 @@ class MujocoSimulator(Simulator):
         # try: 
         # 1. resolve some local file path which is need to run the script
         robot_mjcf=mujoco.MjSpec.from_file(resolve_data_path(actor.robot.mjcf_path, auto_download=True))
+
+        # A fixed evaluation task may need to reproduce the visual domain of
+        # the data-collection MJCF exactly.  Apply the override to the
+        # task-local copy before attaching it, so other tasks and the source
+        # robot asset are left untouched.
+        ground_visual = getattr(self.task, "mujoco_ground_visual", None)
+        if ground_visual:
+            for texture in robot_mjcf.textures:
+                if texture.name == "groundplane":
+                    texture.builtin = getattr(
+                        mujoco.mjtBuiltin,
+                        ground_visual.get("builtin", "mjBUILTIN_FLAT"),
+                    )
+                    texture.rgb1[:] = ground_visual.get("rgb1", [1.0, 1.0, 1.0])
+                    texture.rgb2[:] = ground_visual.get("rgb2", [1.0, 1.0, 1.0])
+                    texture.mark = getattr(
+                        mujoco.mjtMark,
+                        ground_visual.get("mark", "mjMARK_EDGE"),
+                    )
+                    texture.markrgb[:] = ground_visual.get(
+                        "markrgb", [0.0, 0.0, 0.0]
+                    )
+                    texture.width = int(ground_visual.get("width", 64))
+                    texture.height = int(ground_visual.get("height", 64))
+            for material in robot_mjcf.materials:
+                if material.name == "groundplane":
+                    material.texrepeat[:] = ground_visual.get(
+                        "texrepeat", [12.0, 12.0]
+                    )
+                    material.reflectance = float(
+                        ground_visual.get("reflectance", 0.0)
+                    )
         # except FileNotFoundError:
         #     # 2. catch file not found error if files are not auto-downloaded
         #     from huggingface_hub import snapshot_download
@@ -517,6 +608,19 @@ class MujocoSimulator(Simulator):
             and obtain the second coordinates using mujoco (g1_29dof_wholebody_dex3.xml)
             and then i add them up by LUCK and it works! 
             """
+            # Some task datasets were collected from a native MuJoCo camera
+            # authored directly under torso_link.  In that case camera.pose is
+            # already MuJoCo-local (wxyz) and must not receive SIMPLE's
+            # Isaac-to-MuJoCo camera-axis conversion.
+            if getattr(self.task, "mujoco_native_head_camera", False):
+                torso_body.add_camera(
+                    name=cname,
+                    pos=camera.pose.position,
+                    quat=camera.pose.quaternion,
+                    fovy=fovy,
+                )
+                return
+
             DEFAULT_HEAD_CAM_POSITION = np.array([0.05366004+0.0039635, 0.01752999 + 0, 0.4738702 + -0.044], dtype=np.float32)
             DEFAULT_HEAD_CAM_ORIENTATION = np.array([0.91496, 0.0, 0.40355, 0.0], dtype=np.float32)
             q = np.asarray(camera.pose.quaternion, dtype=np.float32)
