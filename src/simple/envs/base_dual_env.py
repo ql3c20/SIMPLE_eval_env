@@ -50,7 +50,9 @@ class BaseDualSim(gym.Env):
     ) -> None:
         self.headless = headless
         self.webrtc = webrtc
-        if "isaac" in sim_mode:
+        use_builtin_isaac = sim_mode in {"isaac", "mujoco_isaac"}
+        use_external_isaac = sim_mode == "mujoco_external_isaac"
+        if use_builtin_isaac:
             if not _ISAAC_LOADED:
                 self._init_isaac(headless, webrtc)
 
@@ -62,18 +64,48 @@ class BaseDualSim(gym.Env):
 
         self.sim_mode = sim_mode
 
-        if "isaac" in self.sim_mode:
+        if use_builtin_isaac:
             from simple.engines.isaacsim import IsaacSimSimulator
             self.isaac = IsaacSimSimulator(self.task, headless=headless)
         else:
             self.isaac = None
         
         from simple.engines import MujocoSimulator
-        self.mujoco = MujocoSimulator(self.task, headless=("isaac" in self.sim_mode) or headless)
-        self.task = TaskRegistry.make(task, *args, **kwargs) if isinstance(task, str) else task
+        self.mujoco = MujocoSimulator(
+            # External Isaac only supplies the policy RGB observation.  When
+            # headless=False, keep the authoritative MuJoCo viewer available
+            # for tracker/ghost debugging without changing either simulator's
+            # ownership of state.
+            self.task, headless=use_builtin_isaac or headless
+        )
+        self.external_isaac = None
+        if use_external_isaac:
+            from simple.engines.external_isaac_ego import ExternalIsaacEgoClient
+
+            self.external_isaac = ExternalIsaacEgoClient(self.task)
         
         self.action_space = self.task.action_space
         self.observation_space = self.task.observation_space
+        if use_external_isaac:
+            # External Isaac owns the RGB resolution.  Keep the task's native
+            # camera configuration unchanged for MuJoCo-only runs, but expose
+            # the real online frame shape to Gym wrappers and validators.
+            assert self.external_isaac is not None
+            observation_spaces = dict(self.observation_space.spaces)
+            for key in ("head_stereo_left", "head_stereo_right"):
+                subspace = observation_spaces.get(key)
+                if subspace is not None:
+                    observation_spaces[key] = gym.spaces.Box(
+                        low=0,
+                        high=255,
+                        shape=(
+                            self.external_isaac.height,
+                            self.external_isaac.width,
+                            3,
+                        ),
+                        dtype=subspace.dtype,
+                    )
+            self.observation_space = gym.spaces.Dict(observation_spaces)
 
     def _init_isaac(self, headless:bool, webrtc:bool = False):
         global _ISAAC_LOADED, _SIMULATION_APP
@@ -129,6 +161,8 @@ class BaseDualSim(gym.Env):
     
     def close(self):
         self.mujoco.close()
+        if self.external_isaac is not None:
+            self.external_isaac.close()
         if _ISAAC_LOADED:
             assert self.isaac is not None
             while (

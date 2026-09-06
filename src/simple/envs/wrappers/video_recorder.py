@@ -59,13 +59,27 @@ class VideoRecorder(gym.Wrapper, gym.utils.RecordConstructorArgs):
         self.video_writers = {}
         for key, subspace in self.unwrapped.observation_space.items():
             if len(subspace.shape) == 3 and subspace.shape[-1] == 3: # only record image observations
+                image = observations[key]
+                if image.ndim != 3 or image.shape[-1] != 3:
+                    raise ValueError(
+                        f"Video observation {key!r} must be HWC RGB, got {image.shape}"
+                    )
+                actual_resolution = image.shape[:2][::-1]
+                declared_resolution = subspace.shape[:2][::-1]
+                if actual_resolution != declared_resolution:
+                    print(
+                        f"[VideoRecorder] {key}: observation space declares "
+                        f"{declared_resolution[0]}x{declared_resolution[1]}, but the "
+                        f"actual frame is {actual_resolution[0]}x{actual_resolution[1]}; "
+                        "recording the actual frame size."
+                    )
                 self.video_writers[key] = VideoWriter(
                     f"{self.work_dir}/{self.name_prefix}/{key}.mp4", 
                     self.framerate, 
-                    subspace.shape[:2][::-1], 
+                    actual_resolution,
                     write_png=self.write_png
                 )
-                self.video_writers[key].write(observations[key])
+                self.video_writers[key].write(image)
 
         self._is_released = False
         return observations, info
@@ -81,10 +95,12 @@ class VideoRecorder(gym.Wrapper, gym.utils.RecordConstructorArgs):
 
         return observation, reward, terminated, truncated, info
     
-    def release(self):
+    def release(self, success: bool | None = None):
         if not self._is_released:
+            if success is None:
+                success = bool(self.unwrapped._success)  # type: ignore
             for video_writer in self.video_writers.values():
-                video_writer.release(self.unwrapped._success) # type: ignore
+                video_writer.release(success)
             self._is_released = True
 
     def close(self):

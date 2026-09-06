@@ -94,6 +94,7 @@ class Gr00tN17SonicAgent(PrimitiveAgent):
         self._decode_count = 0
         self._initial_pose_step = 0
         self._initial_pose_start_q = None
+        self._reset_history = True
 
         self.body_qpos_adrs = None
         self.body_qvel_adrs = None
@@ -299,12 +300,14 @@ class Gr00tN17SonicAgent(PrimitiveAgent):
                         self.robot.mjData.qpos[:7], dtype=np.float32
                     ),
                 )
+            history = {"reset": True} if self._reset_history else {}
+            self._reset_history = False
             action, *_ = self.client.query_action(
                 {"ego_view": observation["head_stereo_left"]},
                 instruction or "move forward to pick up the cylinder",
                 {"sonic_state": sonic_state},
                 {},
-                history={},
+                history=history,
                 dataset="unitree_g1_sonic",
             )
             action = np.asarray(action, dtype=np.float32)
@@ -357,6 +360,7 @@ class Gr00tN17SonicAgent(PrimitiveAgent):
         self._decode_count = 0
         self._initial_pose_step = 0
         self._initial_pose_start_q = None
+        self._reset_history = True
         self._stabilizer._cached_target_q = None
         self._stabilizer._cached_left_hand_q = None
         self._stabilizer._cached_right_hand_q = None

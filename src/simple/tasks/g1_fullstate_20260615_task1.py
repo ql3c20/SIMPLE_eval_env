@@ -11,12 +11,15 @@ import numpy as np
 
 from simple.core.layout import Layout
 from simple.core.types import Pose
+from simple.tasks.g1_fullstate_recordings import FullstateRecordingMixin
 from simple.tasks.g1_wholebody_xmove_pick_teleop import G1WholebodyXMovePickTaskTeleop
 from simple.tasks.registry import TaskRegistry
 
 
 @TaskRegistry.register("g1_fullstate_20260615_task1")
-class G1Fullstate20260615Task1(G1WholebodyXMovePickTaskTeleop):
+class G1Fullstate20260615Task1(
+    FullstateRecordingMixin, G1WholebodyXMovePickTaskTeleop
+):
     """Walk to the round table and pick up the green cylinder."""
 
     uid = "g1_fullstate_20260615_task1"
@@ -27,6 +30,7 @@ class G1Fullstate20260615Task1(G1WholebodyXMovePickTaskTeleop):
         **G1WholebodyXMovePickTaskTeleop.metadata,
         "dr_level": 0,
         "max_episode_steps": 800,
+        "render_hz": 50,
     }
 
     # Keep the declared observation space consistent with the actual camera.
@@ -64,7 +68,7 @@ class G1Fullstate20260615Task1(G1WholebodyXMovePickTaskTeleop):
     _camera_cy = np.cos(_camera_yaw_rad / 2.0)
     _camera_sy = np.sin(_camera_yaw_rad / 2.0)
     sensor_cfgs["head_stereo"].pose = {
-        "position": [0.06, 0.03, 0.45],
+        "position": [0.06, 0.06, 0.40],
         "quaternion": [
             # Native MuJoCo wxyz quaternion for euler xyz:
             # [0, -0.8 rad - TASK1_CAMERA_PITCH_OFFSET_DEG, -1.57].
@@ -94,8 +98,20 @@ class G1Fullstate20260615Task1(G1WholebodyXMovePickTaskTeleop):
     }
 
     _humanoid_vla_root = Path(
-        os.environ.get("HUMANOID_VLA_MJ_ROOT", "/pfs/pfs-ilWc5D/yzh/HumanoidVLA_MJ")
+        os.environ.get(
+            "HUMANOID_VLA_MJ_ROOT",
+            "/home/ubuntu/yzh/HumanoidVLA_MJ_backup/HumanoidVLA_MJ",
+        )
     )
+    recording_env_prefix = "TASK1"
+    recording_default_dir = Path("/home/ubuntu/yzh/mujoco_recordings/20260615_task1_new")
+    recording_nq = 57
+    recording_semantic_fields = {
+        0: "pelvis.floating_base_joint.x",
+        49: "right_hand_index_1_joint.angle",
+        50: "green_grasp_cylinder_free.x",
+        56: "green_grasp_cylinder_free.qz",
+    }
     _asset_root = (
         _humanoid_vla_root
         / "mujoco/model/task_assets/local_mjcf/primitive_round_table_green_cylinder"
@@ -103,22 +119,22 @@ class G1Fullstate20260615Task1(G1WholebodyXMovePickTaskTeleop):
     mujoco_extra_mjcf = [
         {
             "path": _asset_root / "round_table.xml",
-            "prefix": "task1_table_",
+            "prefix": "primitive_round_table_",
             "pos": [1.3, 0.0, 0.0],
         },
         {
             "path": _asset_root / "green_cylinder.xml",
-            "prefix": "task1_cylinder_",
+            "prefix": "green_grasp_cylinder_",
             # Nominal task initialization from scene_43dof.xml.  The first
             # data.csv row is already part-way through the demonstration and
             # places the cylinder almost over the table edge.
             "pos": [1.05, 0.0, 0.825],
             "quat": [1.0, 0.0, 0.0, 0.0],
             "freejoint_body": "object",
-            "freejoint_name": "green_cylinder_free",
+            "freejoint_name": "free",
         },
     ]
-    mujoco_object_body_names = {"target": "task1_cylinder_object"}
+    mujoco_object_body_names = {"target": "green_grasp_cylinder_object"}
     initial_target_height = 0.8249867
     # First recorded robot qpos row from 20260615_141610_g1_sim/data.csv.
     # Ordering matches the G1 Sonic MJCF: floating root + 43 actuated joints.
@@ -143,8 +159,7 @@ class G1Fullstate20260615Task1(G1WholebodyXMovePickTaskTeleop):
         seed: int | None = None,
         options: Optional[dict[str, Any]] = None,
     ) -> None:
-        # This task intentionally has one deterministic initialization, matching
-        # HumanoidVLA_MJ/20260615/20260615_141610_g1_sim.
+        selected = self._select_recording(options)
         self._layout = Layout()
         self._layout.add_robot(self.robot)
         self._layout.robot.pose = Pose(
@@ -155,17 +170,123 @@ class G1Fullstate20260615Task1(G1WholebodyXMovePickTaskTeleop):
         camera_cfg = copy.deepcopy(self.sensor_cfgs["head_stereo"])
         self._layout.add_camera("head_stereo", camera_cfg)
 
-        self._instruction = "move forward to pick up the cylinder"
+        self.mujoco_initial_robot_qpos = selected.qpos[:50].tolist()
+        cylinder_pose = selected.qpos[50:57]
+        self.mujoco_extra_mjcf = copy.deepcopy(type(self).mujoco_extra_mjcf)
+        self.mujoco_extra_mjcf[1]["pos"] = cylinder_pose[:3].tolist()
+        self.mujoco_extra_mjcf[1]["quat"] = cylinder_pose[3:].tolist()
+
+        self._instruction = "walk forward and then pick up the green cylinder"
         self._target = None
-        self._init_target_height = self.initial_target_height
+        self._init_target_height = float(cylinder_pose[2])
+        self._init_target_xy = np.asarray(cylinder_pose[:2], dtype=np.float64).copy()
         self.reward = 0.0
+        self._task1_lift_steps = 0
+        self._task1_grasp_steps = 0
+        self._task1_grasp_anchor_position: np.ndarray | None = None
+        self._task1_last_grasp_sides: tuple[str, ...] = ()
+        self._task1_last_horizontal_move = 0.0
+        self._task1_last_grasp_lift = 0.0
+        self._task1_last_grasp_horizontal_move = 0.0
+        self._task1_success = False
         self.robot.reset(spawn_pose=self._layout.robot.pose)
 
+    @staticmethod
+    def _valid_grasp_sides(contact_body_names: set[str]) -> tuple[str, ...]:
+        """Return hands forming a thumb-opposition grasp on the cylinder.
+
+        A single hand/cylinder contact is only a touch and must not qualify.
+        The palm collision belongs to ``*_wrist_yaw_link`` in this G1 MJCF, so
+        either the palm or an index/middle finger can oppose the thumb.
+        """
+        valid: list[str] = []
+        for side in ("left", "right"):
+            bodies = {
+                name for name in contact_body_names if name.startswith(f"{side}_")
+            }
+            has_thumb = any("_hand_thumb_" in name for name in bodies)
+            has_opposition = any(
+                "_hand_index_" in name
+                or "_hand_middle_" in name
+                or name == f"{side}_wrist_yaw_link"
+                for name in bodies
+            )
+            if has_thumb and has_opposition:
+                valid.append(side)
+        return tuple(valid)
+
+    def _grasp_sides(self, mujoco_env: Any) -> tuple[str, ...]:
+        if mujoco_env is None:
+            raise ValueError("Task1 grasp success requires mujoco_env")
+        model = mujoco_env.mjModel
+        data = mujoco_env.mjData
+        hand_contacts: set[str] = set()
+        target_prefix = "green_grasp_cylinder_"
+        for contact_index in range(data.ncon):
+            contact = data.contact[contact_index]
+            geom1 = model.geom(int(contact.geom1))
+            geom2 = model.geom(int(contact.geom2))
+            body1 = model.body(int(geom1.bodyid)).name or ""
+            body2 = model.body(int(geom2.bodyid)).name or ""
+            if body1.startswith(target_prefix) and body2.startswith(("left_", "right_")):
+                hand_contacts.add(body2)
+            elif body2.startswith(target_prefix) and body1.startswith(("left_", "right_")):
+                hand_contacts.add(body1)
+        return self._valid_grasp_sides(hand_contacts)
+
     def compute_reward(self, info: dict[str, Any], *args, **kwargs) -> float:
-        target_height = float(np.asarray(info["target"])[2])
-        lift = max(0.0, target_height - self.initial_target_height)
-        self.reward = min(1.0, lift / 0.10)
+        target_position = np.asarray(info["target"], dtype=np.float64)[:3]
+        target_height = float(target_position[2])
+        self._last_target_height = target_height
+        lift = max(0.0, target_height - self._init_target_height)
+        horizontal_move = float(np.linalg.norm(target_position[:2] - self._init_target_xy))
+        self._task1_last_horizontal_move = horizontal_move
+
+        grasp_sides = self._grasp_sides(kwargs.get("mujoco_env"))
+        self._task1_last_grasp_sides = grasp_sides
+        if grasp_sides:
+            if self._task1_grasp_anchor_position is None:
+                # Displacement starts only after a real thumb-opposition grasp.
+                # If the cylinder was pushed first, that earlier motion cannot
+                # be reused to satisfy the success criterion.
+                self._task1_grasp_anchor_position = target_position.copy()
+            self._task1_grasp_steps += 1
+            grasp_delta = target_position - self._task1_grasp_anchor_position
+            grasp_lift = max(0.0, float(grasp_delta[2]))
+            grasp_horizontal_move = float(np.linalg.norm(grasp_delta[:2]))
+        else:
+            # Any loss of the grasp breaks continuity.  A later re-grasp gets a
+            # new anchor and must carry the cylinder another 3 cm itself.
+            self._task1_grasp_anchor_position = None
+            self._task1_grasp_steps = 0
+            grasp_lift = 0.0
+            grasp_horizontal_move = 0.0
+
+        self._task1_last_grasp_lift = grasp_lift
+        self._task1_last_grasp_horizontal_move = grasp_horizontal_move
+        threshold_reached = grasp_lift >= 0.05 or grasp_horizontal_move >= 0.09
+        self._task1_lift_steps = self._task1_lift_steps + 1 if threshold_reached else 0
+        if grasp_sides and threshold_reached:
+            self._task1_success = True
+        grasp_progress = max(grasp_lift, grasp_horizontal_move)
+        self.reward = 1.0 if self._task1_success else min(0.9, grasp_progress / 0.03)
         return self.reward
 
     def check_success(self, info: dict[str, Any], *args, **kwargs) -> bool:
-        return self.compute_reward(info, *args, **kwargs) >= self.success_criteria
+        return bool(self._task1_success)
+
+    def evaluation_metrics(self) -> dict[str, Any]:
+        return {
+            "lift_m": float(max(0.0, self._last_target_height - self._init_target_height))
+            if hasattr(self, "_last_target_height")
+            else 0.0,
+            "horizontal_move_m": float(self._task1_last_horizontal_move),
+            "grasped": bool(self._task1_last_grasp_sides),
+            "grasp_sides": list(self._task1_last_grasp_sides),
+            "grasp_hold_steps": int(self._task1_grasp_steps),
+            "grasp_carried_lift_m": float(self._task1_last_grasp_lift),
+            "grasp_carried_horizontal_m": float(
+                self._task1_last_grasp_horizontal_move
+            ),
+            "lift_hold_steps": int(self._task1_lift_steps),
+        }

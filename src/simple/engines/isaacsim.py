@@ -359,14 +359,15 @@ class IsaacSimSimulator(Simulator):
 
             # data_dir = resolve_data_path
             try:
-                data_dir = resolve_data_path(scene.data_dir, auto_download=True) #f"scenes/hssd/{scene_name}" 
+                env_url = scene.resolve_usd_path(auto_download=True)
             except FileNotFoundError:
                 # put download logic into SceneManager
                 from simple.scenes import SceneManager
                 SceneManager.get(scene.uid.split(":")[0]).load(scene.uid)
-                data_dir = resolve_data_path(scene.data_dir)
+                env_url = scene.resolve_usd_path(auto_download=False)
 
-            env_url = os.path.abspath(f"{data_dir}/{scene.name}.usd")
+            env_url = os.path.abspath(env_url)
+            print(f"Loading HSSD scene {scene.uid} from {env_url}")
             isaacsim_stage.add_reference_to_stage(usd_path=env_url, prim_path=scene_prim_path)
             scene_prim = self.world.stage.GetPrimAtPath(scene_prim_path)
 

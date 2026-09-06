@@ -16,6 +16,8 @@ TASK_PROJ_GRAV_ANCHOR_EE_OBS_ONESTEP_TRANSFORMER_VAE = (
     "Tracking-Flat-G1-ProjGravAnchorEEObsOneStep-TransformerVAE-NMMLP-v0"
 )
 TEXTOP_TASK = os.environ.get("TEXTOP_TASK", TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE)
+TEXTOP_VAE_PROVIDER = os.environ.get("TEXTOP_VAE_PROVIDER", "cuda").strip().lower()
+TEXTOP_POLICY_PROVIDER = os.environ.get("TEXTOP_POLICY_PROVIDER", "cpu").strip().lower()
 
 TEXTOP_ROOT = Path(os.environ.get("TEXTOP_ROOT", "/pfs/pfs-ilWc5D/yzh"))
 TRACKER_RUN = Path(
@@ -100,6 +102,26 @@ def _textop_obs_dims(task: str, future_steps: int) -> np.ndarray:
         else:
             dims.append(motion_future_steps * TEXTOP_EEOBS_FUTURE_DIMS[term])
     return np.asarray(dims, dtype=np.int32)
+
+
+def _ort_providers(ort, requested: str, component: str) -> list[str]:
+    if requested == "cpu":
+        return ["CPUExecutionProvider"]
+    if requested != "cuda":
+        raise ValueError(
+            f"Unsupported {component} provider {requested!r}; use 'cuda' or 'cpu'."
+        )
+
+    preload_dlls = getattr(ort, "preload_dlls", None)
+    if callable(preload_dlls):
+        preload_dlls(directory="")
+    available = ort.get_available_providers()
+    if "CUDAExecutionProvider" not in available:
+        raise RuntimeError(
+            f"{component} requested CUDAExecutionProvider, but ONNX Runtime only "
+            f"provides {available}. Install onnxruntime-gpu in the active environment."
+        )
+    return ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
 DEFAULT_BODY_NAMES = [
     "pelvis",
@@ -340,10 +362,20 @@ class TextOpTrackerAdapter:
         self.body_qpos_adrs = np.asarray(self.body_qpos_adrs, dtype=np.int32)
         self.body_qvel_adrs = np.asarray(self.body_qvel_adrs, dtype=np.int32)
 
-        providers = ["CPUExecutionProvider"]
-        if "CUDAExecutionProvider" in ort.get_available_providers():
-            providers.insert(0, "CUDAExecutionProvider")
-        self.vae_session = ort.InferenceSession(str(vae_onnx or DEFAULT_VAE_ONNX), providers=providers)
+        vae_providers = _ort_providers(ort, TEXTOP_VAE_PROVIDER, "TextOp VAE")
+        policy_providers = _ort_providers(ort, TEXTOP_POLICY_PROVIDER, "TextOp policy")
+        self.vae_session = ort.InferenceSession(
+            str(vae_onnx or DEFAULT_VAE_ONNX),
+            providers=vae_providers,
+        )
+        if (
+            TEXTOP_VAE_PROVIDER == "cuda"
+            and self.vae_session.get_providers()[0] != "CUDAExecutionProvider"
+        ):
+            raise RuntimeError(
+                "TextOp VAE CUDA provider initialization failed; active providers are "
+                f"{self.vae_session.get_providers()}."
+            )
         self.vae_input = self.vae_session.get_inputs()[0].name
         vae_shape = self.vae_session.get_inputs()[0].shape
         if len(vae_shape) >= 3 and isinstance(vae_shape[1], int) and vae_shape[1] != self.vae_window_steps:
@@ -352,7 +384,10 @@ class TextOpTrackerAdapter:
                 f"{self.vae_window_steps}. Check TEXTOP_VAE_ONNX and TEXTOP_VAE_WINDOW_STEPS."
             )
         self.vae_output = "z_c" if any(o.name == "z_c" for o in self.vae_session.get_outputs()) else self.vae_session.get_outputs()[0].name
-        self.policy_session = ort.InferenceSession(str(policy_onnx or DEFAULT_POLICY_ONNX), providers=providers)
+        self.policy_session = ort.InferenceSession(
+            str(policy_onnx or DEFAULT_POLICY_ONNX),
+            providers=policy_providers,
+        )
         self.policy_input = self.policy_session.get_inputs()[0].name
         policy_shape = self.policy_session.get_inputs()[0].shape
         if len(policy_shape) >= 2 and isinstance(policy_shape[1], int) and policy_shape[1] != self.expected_obs_dim:
@@ -360,6 +395,11 @@ class TextOpTrackerAdapter:
                 f"TextOp policy input dim {policy_shape[1]} does not match task={self.task} "
                 f"expected_obs_dim={self.expected_obs_dim}. Check TEXTOP_TASK and TEXTOP_FUTURE_STEPS."
             )
+        print(
+            "[TextOpTrackerAdapter] "
+            f"VAE providers={self.vae_session.get_providers()}, "
+            f"policy providers={self.policy_session.get_providers()}"
+        )
 
         stats = np.load(DEFAULT_VAE_STATS)
         self.mean = stats["mean"].astype(np.float32)

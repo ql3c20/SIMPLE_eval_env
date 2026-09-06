@@ -67,6 +67,11 @@ class KimodoAdapterConfig:
     max_abs_vy: float = float(os.environ.get("KIMODO_MAX_ABS_VY", "0.08"))
     max_abs_vyaw: float = float(os.environ.get("KIMODO_MAX_ABS_VYAW", "0.25"))
     anchor_mode: str = os.environ.get("KIMODO_ANCHOR_MODE", "policy_only")
+    policy_only_initial_qpos: bool = (
+        os.environ.get("KIMODO_POLICY_ONLY_INITIAL_QPOS", "0") == "1"
+    )
+    rtc_prefix_frames: int = int(os.environ.get("KIMODO_RTC_PREFIX_FRAMES", "0"))
+    rtc_prefix_blend_frames: int = int(os.environ.get("KIMODO_RTC_PREFIX_BLEND_FRAMES", "0"))
     episode_subdir: bool = os.environ.get("KIMODO_EPISODE_SUBDIR", "1") == "1"
 
 
@@ -148,15 +153,76 @@ def _smooth_1d(values: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid").astype(np.float32)
 
 
+def _inherit_qpos_prefix(
+    generated: np.ndarray,
+    prefix: np.ndarray,
+    blend_frames: int = 0,
+) -> np.ndarray:
+    out = np.asarray(generated, dtype=np.float32).copy()
+    inherited = np.asarray(prefix, dtype=np.float32)
+    if out.ndim != 2 or out.shape[1] != 36:
+        raise ValueError(f"Expected generated qpos shape (T, 36), got {out.shape}")
+    if inherited.ndim != 2 or inherited.shape[1] != 36:
+        raise ValueError(f"Expected prefix qpos shape (T, 36), got {inherited.shape}")
+    prefix_frames = min(int(inherited.shape[0]), int(out.shape[0]))
+    if prefix_frames <= 0:
+        return out
+
+    out[:prefix_frames] = inherited[-prefix_frames:]
+    if blend_frames <= 0 or prefix_frames >= out.shape[0]:
+        return out
+    if blend_frames == 1:
+        raise ValueError("KIMODO_RTC_PREFIX_BLEND_FRAMES must be 0 or >= 2")
+
+    blend_count = min(int(blend_frames), int(out.shape[0] - prefix_frames))
+    blend_u = np.linspace(0.0, 1.0, blend_count, dtype=np.float64)
+    weights = 1.0 - blend_u * blend_u * (3.0 - 2.0 * blend_u)
+
+    generated64 = np.asarray(generated, dtype=np.float64)
+    linear_indices = np.r_[0:3, 7:36]
+    linear_offset = inherited[-1, linear_indices].astype(np.float64) - generated64[
+        prefix_frames - 1, linear_indices
+    ]
+    out[prefix_frames : prefix_frames + blend_count, linear_indices] = (
+        generated64[prefix_frames : prefix_frames + blend_count, linear_indices]
+        + weights[:, None] * linear_offset[None, :]
+    ).astype(np.float32)
+
+    prefix_rotation = R.from_quat(inherited[-1, 3:7], scalar_first=True)
+    generated_boundary = R.from_quat(generated64[prefix_frames - 1, 3:7], scalar_first=True)
+    rotation_offset = prefix_rotation * generated_boundary.inv()
+    rotation_blend = Slerp(
+        [0.0, 1.0],
+        R.concatenate([R.identity(), rotation_offset]),
+    )(weights)
+    generated_rotations = R.from_quat(
+        generated64[prefix_frames : prefix_frames + blend_count, 3:7],
+        scalar_first=True,
+    )
+    out[prefix_frames : prefix_frames + blend_count, 3:7] = (
+        rotation_blend * generated_rotations
+    ).as_quat(scalar_first=True).astype(np.float32)
+    return out
+
+
 class KimodoPolicyAdapter:
     def __init__(self, cfg: KimodoAdapterConfig | None = None):
         self.cfg = cfg or KimodoAdapterConfig()
         self._call_index = 0
         self._episode_index = -1
+        self._episode_chunk_index = 0
+        self._server_config: dict[str, object] | None = None
+        self._previous_qpos_tail: np.ndarray | None = None
+        if self.cfg.rtc_prefix_frames < 0:
+            raise ValueError("KIMODO_RTC_PREFIX_FRAMES must be >= 0")
+        if self.cfg.rtc_prefix_blend_frames < 0 or self.cfg.rtc_prefix_blend_frames == 1:
+            raise ValueError("KIMODO_RTC_PREFIX_BLEND_FRAMES must be 0 or >= 2")
 
     def begin_episode(self) -> None:
         self._episode_index += 1
         self._call_index = 0
+        self._episode_chunk_index = 0
+        self._previous_qpos_tail = None
 
     def policy44_to_simple36(
         self,
@@ -177,15 +243,25 @@ class KimodoPolicyAdapter:
         policy_constraints28 = constraints28.copy()
         hand14 = policy_action[:, :14].astype(np.float32)
         target_yaw = root6[:, 5:6].astype(np.float32)
+        prefix_qpos_world = None
+        if self.cfg.rtc_prefix_frames > 0 and self._previous_qpos_tail is not None:
+            prefix_qpos_world = self._previous_qpos_tail[-self.cfg.rtc_prefix_frames :].copy()
 
         root_xy = policy_constraints28[:, :2].copy()
         policy_anchor_xy = root_xy[0].copy()
-        use_current_start = self.cfg.anchor_mode in {"current", "policy_delta"}
-        if self.cfg.anchor_mode not in {"current", "policy_delta", "policy_only"}:
+        anchor_mode = self._effective_anchor_mode()
+        use_current_start = anchor_mode in {"current", "policy_delta"}
+        if anchor_mode not in {"current", "policy_delta", "policy_only"}:
             raise ValueError(
-                f"Unsupported KIMODO_ANCHOR_MODE={self.cfg.anchor_mode!r}; "
+                f"Unsupported KIMODO_ANCHOR_MODE={anchor_mode!r}; "
                 "use policy_only, policy_delta, or current."
             )
+        constrain_episode_start = (
+            self.cfg.policy_only_initial_qpos
+            and anchor_mode == "policy_only"
+            and self._episode_chunk_index == 0
+            and prev_qpos_mujoco is not None
+        )
 
         if prev_qpos_mujoco is not None and use_current_start:
             prev_qpos_mujoco = np.asarray(prev_qpos_mujoco, dtype=np.float64).reshape(-1)
@@ -205,13 +281,13 @@ class KimodoPolicyAdapter:
 
         constraints_local = constraints28.copy()
         recenter_xy = anchor_xy
-        if prev_qpos_mujoco is not None and self.cfg.anchor_mode == "policy_delta":
+        if prev_qpos_mujoco is not None and anchor_mode == "policy_delta":
             # Future root/EE constraints come from the policy's own predicted coordinate frame.
             # Use only their displacement from the policy's first predicted root, then attach that
             # local plan to the current simulated root.  This avoids pulling the robot back toward
             # any absolute-coordinate bias in the policy output.
             recenter_xy = policy_anchor_xy
-        elif self.cfg.anchor_mode == "policy_only":
+        elif anchor_mode == "policy_only":
             recenter_xy = policy_anchor_xy
 
         constraints_local[:, 0] -= recenter_xy[0]
@@ -220,7 +296,7 @@ class KimodoPolicyAdapter:
             constraints_local[:, start] -= recenter_xy[0]
             constraints_local[:, start + 1] -= recenter_xy[1]
 
-        if prev_qpos_mujoco is not None and self.cfg.anchor_mode == "policy_delta":
+        if prev_qpos_mujoco is not None and anchor_mode == "policy_delta":
             constraints_local[0, 0] = 0.0
             constraints_local[0, 1] = 0.0
             if current_constraints28_mujoco is not None:
@@ -236,21 +312,52 @@ class KimodoPolicyAdapter:
             start_qpos_local = np.asarray(start_qpos_local, dtype=np.float32).reshape(-1, 36)
             start_qpos_local[:, 0] -= anchor_xy[0]
             start_qpos_local[:, 1] -= anchor_xy[1]
+            prefix_qpos_local = None
+            if prefix_qpos_world is not None:
+                prefix_model_frames = max(
+                    1,
+                    int(round((prefix_qpos_world.shape[0] - 1) * self.cfg.kimodo_fps / self.cfg.output_fps))
+                    + 1,
+                )
+                prefix_qpos_local = _resample_qpos(
+                    prefix_qpos_world,
+                    input_fps=self.cfg.output_fps,
+                    output_fps=self.cfg.kimodo_fps,
+                    target_frames=prefix_model_frames,
+                )
+                prefix_qpos_local[:, 0] -= anchor_xy[0]
+                prefix_qpos_local[:, 1] -= anchor_xy[1]
             np.savez(
                 heading_path,
                 qpos=start_qpos_local,
                 anchor_xy=np.asarray(anchor_xy, dtype=np.float32),
                 recenter_xy=np.asarray(recenter_xy, dtype=np.float32),
-                anchor_mode=np.asarray(self.cfg.anchor_mode),
+                anchor_mode=np.asarray(anchor_mode),
             )
-            self._write_constraints_json(constraints_local, constraints_path)
+            self._write_constraints_json(
+                constraints_local,
+                constraints_path,
+                keyframe_step=self._effective_keyframe_step(),
+                skip_first_frame=constrain_episode_start,
+            )
+            request_start_qpos = (
+                start_qpos_local[0]
+                if prev_qpos_mujoco is not None and (use_current_start or constrain_episode_start)
+                else None
+            )
+            if constrain_episode_start:
+                print(
+                    "[KimodoAdapter] policy_only episode frame-0 qpos constraint enabled",
+                    flush=True,
+                )
             self._run_kimodo(
                 constraints_path=constraints_path,
                 heading_path=heading_path,
                 output_stem=output_stem,
                 duration_sec=policy_action.shape[0] / self.cfg.source_fps,
                 prompt=instruction or self.cfg.prompt,
-                start_qpos_mujoco=start_qpos_local[0] if use_current_start and prev_qpos_mujoco is not None else None,
+                start_qpos_mujoco=request_start_qpos,
+                prefix_qpos_mujoco=prefix_qpos_local,
             )
             qpos = np.loadtxt(str(output_stem.with_suffix(".csv")), delimiter=",").astype(np.float32)
             if qpos.ndim == 1:
@@ -266,8 +373,35 @@ class KimodoPolicyAdapter:
         qpos50[:, 1] += anchor_xy[1]
         if prev_qpos_mujoco is not None and use_current_start:
             qpos50[0] = prev_qpos_mujoco.astype(np.float32)
+        if constrain_episode_start:
+            # The reset state is authoritative.  The dense Kimodo constraint
+            # should already reproduce it, but explicitly pin the resampled
+            # output so CSV row 0, Isaac request 0 and Kimodo qpos50[0] are
+            # numerically identical before TextOp executes its first target.
+            qpos50[0] = prev_qpos_mujoco.astype(np.float32)
+            if not np.array_equal(qpos50[0], prev_qpos_mujoco.astype(np.float32)):
+                raise RuntimeError("failed to pin Kimodo frame 0 to the reset qpos")
+            print(
+                "[KimodoAdapter] aligned qpos50[0] exactly to current reset qpos",
+                flush=True,
+            )
+        if prefix_qpos_world is not None:
+            qpos50 = _inherit_qpos_prefix(
+                qpos50,
+                prefix_qpos_world,
+                blend_frames=self.cfg.rtc_prefix_blend_frames,
+            )
+            print(
+                "[KimodoAdapter] inherited qpos prefix: "
+                f"frames={prefix_qpos_world.shape[0]} "
+                f"blend_frames={self.cfg.rtc_prefix_blend_frames}",
+                flush=True,
+            )
+        if self.cfg.rtc_prefix_frames > 0:
+            self._previous_qpos_tail = qpos50[-self.cfg.rtc_prefix_frames :].copy()
 
         simple36 = self._qpos_to_simple36(qpos50, hand14=hand14, target_yaw=target_yaw)
+        self._episode_chunk_index += 1
         return simple36, qpos50
 
     def _heading_qpos(self, prev_qpos_mujoco: np.ndarray | None, constraints28: np.ndarray) -> np.ndarray:
@@ -280,9 +414,57 @@ class KimodoPolicyAdapter:
         ).astype(np.float32)
         return qpos
 
-    def _write_constraints_json(self, constraints28: np.ndarray, path: Path) -> None:
-        src_idx = _select_keyframes(constraints28.shape[0], self.cfg.keyframe_step)
-        if 0 not in src_idx:
+    def _get_server_config(self) -> dict[str, object]:
+        if not self.cfg.server_url:
+            return {}
+        if self._server_config is None:
+            import requests
+
+            response = requests.get(
+                self.cfg.server_url.rstrip("/") + "/config",
+                timeout=10,
+            )
+            if response.status_code == 404:
+                self._server_config = {}
+                print(
+                    "[KimodoAdapter] Server /config unavailable; using local "
+                    f"keyframe_step={self.cfg.keyframe_step}, anchor_mode={self.cfg.anchor_mode}",
+                    flush=True,
+                )
+                return self._server_config
+            response.raise_for_status()
+            self._server_config = dict(response.json())
+            print(
+                "[KimodoAdapter] Using server config: "
+                f"keyframe_step={self._server_config.get('keyframe_step')}, "
+                f"anchor_mode={self._server_config.get('anchor_mode')}",
+                flush=True,
+            )
+        return self._server_config
+
+    def _effective_keyframe_step(self) -> int:
+        config = self._get_server_config()
+        return max(1, int(config.get("keyframe_step", self.cfg.keyframe_step)))
+
+    def _effective_anchor_mode(self) -> str:
+        config = self._get_server_config()
+        return str(config.get("anchor_mode", self.cfg.anchor_mode))
+
+    def _write_constraints_json(
+        self,
+        constraints28: np.ndarray,
+        path: Path,
+        *,
+        keyframe_step: int | None = None,
+        skip_first_frame: bool = False,
+    ) -> None:
+        step = self.cfg.keyframe_step if keyframe_step is None else keyframe_step
+        src_idx = _select_keyframes(constraints28.shape[0], step)
+        if skip_first_frame:
+            src_idx = src_idx[src_idx != 0]
+            if len(src_idx) == 0:
+                raise ValueError("Cannot skip the only policy constraint frame")
+        elif 0 not in src_idx:
             src_idx = np.insert(src_idx, 0, 0)
         dst_idx = np.round(src_idx * self.cfg.kimodo_fps / self.cfg.source_fps).astype(np.int64)
         keep = np.ones(len(dst_idx), dtype=bool)
@@ -335,6 +517,7 @@ class KimodoPolicyAdapter:
         duration_sec: float,
         prompt: str,
         start_qpos_mujoco: np.ndarray | None = None,
+        prefix_qpos_mujoco: np.ndarray | None = None,
     ) -> None:
         if self.cfg.server_url:
             self._run_kimodo_server(
@@ -344,8 +527,12 @@ class KimodoPolicyAdapter:
                 duration_sec=duration_sec,
                 prompt=prompt,
                 start_qpos_mujoco=start_qpos_mujoco,
+                prefix_qpos_mujoco=prefix_qpos_mujoco,
             )
             return
+
+        if prefix_qpos_mujoco is not None:
+            raise RuntimeError("Kimodo qpos prefix inheritance requires KIMODO_SERVER_URL")
 
         script = self.cfg.kimodo_root / "scripts" / "generate_g1_with_first_heading.py"
         cmd = [
@@ -398,6 +585,7 @@ class KimodoPolicyAdapter:
         duration_sec: float,
         prompt: str,
         start_qpos_mujoco: np.ndarray | None = None,
+        prefix_qpos_mujoco: np.ndarray | None = None,
     ) -> None:
         import requests
 
@@ -418,6 +606,10 @@ class KimodoPolicyAdapter:
         }
         if start_qpos_mujoco is not None:
             payload["start_qpos_mujoco"] = np.asarray(start_qpos_mujoco, dtype=np.float32).reshape(36).tolist()
+        if prefix_qpos_mujoco is not None:
+            payload["prefix_qpos_mujoco"] = np.asarray(
+                prefix_qpos_mujoco, dtype=np.float32
+            ).reshape(-1, 36).tolist()
         if self.cfg.seed is not None:
             payload["seed"] = int(self.cfg.seed + self._call_index)
         self._call_index += 1

@@ -50,6 +50,14 @@ def _append_eval_stats_line(eval_dir: str, line: str) -> None:
         os.fsync(f.fileno())
 
 
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", buffering=1) as stream:
+        stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def _root_roll_pitch_from_wxyz(quat) -> tuple[float, float]:
     w, x, y, z = [float(v) for v in quat]
     norm = math.sqrt(w * w + x * x + y * y + z * z)
@@ -257,8 +265,8 @@ def _run_eval_worker(
     elif data_format == "fixed":
         # Deterministic task-owned initialization; no recorded eval dataset is
         # needed.  The task reset() constructs the scene for every episode.
-        dataset = [None] * num_episodes
-        dataset_size = num_episodes
+        dataset = [None] * (episode_start + num_episodes)
+        dataset_size = episode_start + num_episodes
         render_hz = 50
 
         def get_episode(dataset_obj, idx):
@@ -330,7 +338,30 @@ def _run_eval_worker(
         else:
             env = raw_env
 
-        observation, info = env.reset(options={"state_dict": env_conf})
+        reset_started = time.perf_counter()
+        try:
+            observation, info = env.reset(
+                options={"state_dict": env_conf, "episode_index": eps_idx}
+            )
+        except Exception as exc:
+            _append_jsonl(
+                Path(eval_dir) / "results.jsonl",
+                {
+                    "task": task.uid,
+                    "episode": eps_idx,
+                    "recording": getattr(task, "selected_recording_name", None),
+                    "recording_index": getattr(task, "selected_recording_index", None),
+                    "seed": getattr(task, "selected_recording_seed", None),
+                    "scene_sha256": getattr(task, "selected_recording_scene_sha256", None),
+                    "trash_translate": getattr(task, "task2_trash_translate", None),
+                    "success": False,
+                    "reason": f"reset_or_isaac_error:{type(exc).__name__}:{exc}",
+                    "steps": 0,
+                    "elapsed_seconds": time.perf_counter() - reset_started,
+                    "metrics": {},
+                },
+            )
+            raise
 
         reset_before_stabilize = bool(
             getattr(agent, "reset_before_stabilize", False)
@@ -385,12 +416,17 @@ def _run_eval_worker(
             agent.reset(**reset_kwargs)
         episode_over = False
         fall_stop_reason = ""
+        policy_stop_iteration = False
+        runtime_error: Exception | None = None
+        last_truncated = False
         while not episode_over:
             try:
                 action = agent.get_action(
                     observation, info=info, instruction=instruction
                 )
                 observation, reward, terminated, truncated, info = env.step(action)
+                sonic_env.update_viewer()
+                last_truncated = bool(truncated)
                 episode_over = terminated or truncated
                 frame_idx += 1
                 fall_stop, fall_stop_reason = _fall_stop_triggered(robot)
@@ -401,15 +437,59 @@ def _run_eval_worker(
                     report("episode_step", episode=task_id, step=frame_idx)
             except StopIteration:
                 episode_over = True
+                policy_stop_iteration = True
                 print("Episode finished.")
+            except Exception as exc:
+                episode_over = True
+                runtime_error = exc
+                print(
+                    f"[EpisodeRuntimeError] {task_id}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
 
         is_success = raw_env.unwrapped._success  # type: ignore[attr-defined]
         if fall_stop_reason:
             is_success = False
+        if runtime_error is not None:
+            is_success = False
         stats[task_id] = is_success
         episode_seconds = time.perf_counter() - episode_start_time
-        suffix = f" fall_stop={fall_stop_reason}" if fall_stop_reason else ""
+        if is_success:
+            reason = "success"
+        elif runtime_error is not None:
+            reason = f"policy_or_isaac_error:{type(runtime_error).__name__}:{runtime_error}"
+        elif fall_stop_reason:
+            reason = f"fall:{fall_stop_reason}"
+        elif last_truncated:
+            reason = "timeout"
+        elif policy_stop_iteration:
+            reason = "policy_stop_iteration"
+        else:
+            reason = "terminated_without_success"
+        suffix = f" reason={reason}"
         _append_eval_stats_line(eval_dir, f"{task_id}: {is_success}{suffix} \n")
+        metrics = (
+            task.evaluation_metrics()
+            if hasattr(task, "evaluation_metrics")
+            else {}
+        )
+        _append_jsonl(
+            Path(eval_dir) / "results.jsonl",
+            {
+                "task": task.uid,
+                "episode": eps_idx,
+                "recording": getattr(task, "selected_recording_name", None),
+                "recording_index": getattr(task, "selected_recording_index", None),
+                "seed": getattr(task, "selected_recording_seed", None),
+                "scene_sha256": getattr(task, "selected_recording_scene_sha256", None),
+                "trash_translate": getattr(task, "task2_trash_translate", None),
+                "success": bool(is_success),
+                "reason": reason,
+                "steps": frame_idx,
+                "elapsed_seconds": episode_seconds,
+                "metrics": metrics,
+            },
+        )
         report(
             "episode_end",
             episode=task_id,
@@ -423,7 +503,11 @@ def _run_eval_worker(
         )
 
         if save_video and isinstance(env, VideoRecorder):
-            env.release()
+            env.release(success=bool(is_success))
+        if runtime_error is not None:
+            raise RuntimeError(
+                f"{task_id} stopped because the policy/Isaac chain failed"
+            ) from runtime_error
 
     persist_payload("ok", dict(stats))
     report("worker_status", status="closing")
@@ -446,6 +530,8 @@ def run_eval(
 ) -> EvalResult:
     if config.num_workers <= 0:
         raise ValueError(f"num_workers must be > 0, got {config.num_workers}")
+    if config.sim_mode == "mujoco_external_isaac" and config.num_workers != 1:
+        raise ValueError("mujoco_external_isaac requires num_workers=1")
     if agent_factory is not None and config.num_workers != 1:
         raise ValueError("custom agent_factory is only supported with num_workers=1")
 
@@ -685,6 +771,78 @@ def run_eval(
     console.print(f"Eval log: {log_path}")
 
     _append_eval_stats_line(eval_dir, f"success rate: {sr:.2f} \n")
+    results_path = Path(eval_dir) / "results.jsonl"
+    current_results: dict[int, dict[str, Any]] = {}
+    if results_path.is_file():
+        for line in results_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            episode = item.get("episode")
+            if (
+                item.get("task") == env_id.split("/", 1)[-1].replace("-v0", "")
+                and isinstance(episode, int)
+                and episode_start <= episode < episode_start + num_episodes
+            ):
+                current_results[episode] = item
+    # Task uid uses snake_case while the Gym id uses PascalCase. If that filter
+    # found nothing, use the requested episode range; eval directories are
+    # task-specific in the deployment wrappers.
+    if not current_results and results_path.is_file():
+        for line in results_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                item = json.loads(line)
+                episode = item.get("episode")
+                if isinstance(episode, int) and episode_start <= episode < episode_start + num_episodes:
+                    current_results[episode] = item
+    completed = len(current_results)
+    succeeded = sum(bool(item.get("success")) for item in current_results.values())
+    camera_config = {
+        "width": 640,
+        "height": 480,
+        "rate_hz": 50,
+        "vertical_fov_deg": 70.0,
+        "pitch_down_deg": 15.0,
+        "distortion": False,
+        "local_eye": os.environ.get("EXTERNAL_ISAAC_CAMERA_LOCAL_EYE", ""),
+    }
+    summary = {
+        "task": env_id,
+        "planned": num_episodes,
+        "episode_start": episode_start,
+        "completed": completed,
+        "successes": succeeded,
+        "failures": completed - succeeded,
+        "success_rate": (succeeded / completed) if completed else 0.0,
+        "checkpoint": os.environ.get("GR00T_MODEL_PATH"),
+        "scene_sha256": next(
+            (
+                item.get("scene_sha256")
+                for item in current_results.values()
+                if item.get("scene_sha256")
+            ),
+            os.environ.get("TASK_SCENE_SHA256"),
+        ),
+        "camera": camera_config,
+        "trash_translate": next(
+            (
+                item.get("trash_translate")
+                for item in current_results.values()
+                if item.get("trash_translate") is not None
+            ),
+            None,
+        ),
+        "recording_order": [
+            current_results[index].get("recording") for index in sorted(current_results)
+        ],
+    }
+    summary_path = Path(eval_dir) / "summary.json"
+    temporary_summary = summary_path.with_suffix(".json.tmp")
+    temporary_summary.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary_summary, summary_path)
     if terminal_stream is not None:
         terminal_stream.close()
     return EvalResult(

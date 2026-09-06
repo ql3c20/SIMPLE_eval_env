@@ -53,6 +53,30 @@ class HssdSuite(TabletopScene):
         self.center_orientation = [(u + d) / 2.0 for u, d in zip(self.conf["center_orientation_limit_up"], self.conf["center_orientation_limit_down"])]
         return self
 
+    def resolve_usd_path(self, auto_download: bool = True) -> str:
+        """Resolve the HSSD USD used by Isaac Sim.
+
+        Some downloaded HSSD stages contain absolute references to the machine
+        that packaged them.  A sibling ``<scene>_local.usd`` can hold the same
+        stage with those references rewritten to the local ``props`` and
+        ``textures`` directories.  Keep the upstream asset as the default and
+        select the derived stage explicitly.
+        """
+        scene_dir = resolve_data_path(self.data_dir, auto_download=auto_download)
+        original_path = os.path.join(scene_dir, f"{self.name}.usd")
+
+        use_local = os.getenv("SIMPLE_HSSD_USE_LOCAL_USD", "").strip().lower()
+        if use_local not in {"1", "true", "yes", "on"}:
+            return original_path
+
+        local_path = os.path.join(scene_dir, f"{self.name}_local.usd")
+        if not os.path.isfile(local_path):
+            raise FileNotFoundError(
+                f"SIMPLE_HSSD_USE_LOCAL_USD is enabled, but the derived HSSD "
+                f"stage does not exist: {local_path}"
+            )
+        return local_path
+
 @SceneManager.register("hssd")
 class HssdSceneManager(SceneManager):
 
@@ -76,13 +100,12 @@ class HssdSceneManager(SceneManager):
             scene_uid = scene_uid.split(":")[1]
 
         hssd_scenes_dict = {s["uid"]:s for s in self.hssd_scenes}
-        scene_name = hssd_scenes_dict[scene_uid]["name"]
+        scene = HssdSuite(hssd_scenes_dict[scene_uid])
+        usd_path = scene.resolve_usd_path(auto_download=True)
+        if not usd_path.endswith("_local.usd"):
+            self._hack_fix_tmp_paths(usd_path)
 
-        scene_dir = resolve_data_path(f"scenes/hssd/{scene_name}",auto_download=True)
-        usd_path = os.path.join(scene_dir, f"{scene_name}.usd")
-        self._hack_fix_tmp_paths(usd_path)
-        
-        return HssdSuite(hssd_scenes_dict[scene_uid])
+        return scene
 
     def _hack_fix_tmp_paths(self, usd_path: str) -> None:
         import subprocess
@@ -118,4 +141,3 @@ class HssdSceneManager(SceneManager):
         except Exception as e:
             print(f"Error in _hack_fix_tmp_paths: {e}")
     
-

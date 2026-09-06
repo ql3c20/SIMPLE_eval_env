@@ -23,7 +23,11 @@ class Psi0KimodoTextOpTrackerAgent(Psi0KimodoDecoupledWbcAgent):
     def __init__(self, robot, host: str, port: int, upsample_factor=1, **kwargs):
         super().__init__(robot, host, port, upsample_factor=upsample_factor, **kwargs)
         self._textop_adapter = None
-        self._direct_queue: list[ActionCmd | tuple[dict[str, np.ndarray], int, np.ndarray]] = []
+        self._direct_queue: list[
+            ActionCmd
+            | tuple[dict[str, np.ndarray], int, np.ndarray]
+            | tuple[dict[str, np.ndarray], int, np.ndarray, np.ndarray]
+        ] = []
         self._rate_limit = os.environ.get("TEXTOP_TARGET_RATE_LIMIT", "0") == "1"
         self._leg_max_delta = float(os.environ.get("TEXTOP_LEG_MAX_DELTA", "0.03"))
         self._torso_max_delta = float(os.environ.get("TEXTOP_TORSO_MAX_DELTA", "0.04"))
@@ -38,6 +42,31 @@ class Psi0KimodoTextOpTrackerAgent(Psi0KimodoDecoupledWbcAgent):
         self._use_policy_root_ee = os.environ.get("TEXTOP_POLICY_ROOT_EE", "0") == "1"
         self._rot6d59_convention = os.environ.get("ROT6D59_CONVENTION", "cols_rowmajor")
         self._printed_rot6d59_convention = False
+        execution_horizon = os.environ.get("POLICY_EXECUTION_HORIZON")
+        self._policy_execution_horizon = (
+            None if execution_horizon in (None, "") else int(execution_horizon)
+        )
+        action_horizon = os.environ.get("POLICY_ACTION_HORIZON")
+        self._policy_action_horizon = (
+            None if action_horizon in (None, "") else int(action_horizon)
+        )
+        if self._policy_execution_horizon is not None and self._policy_execution_horizon <= 0:
+            raise ValueError(
+                "POLICY_EXECUTION_HORIZON must be positive, "
+                f"got {self._policy_execution_horizon}"
+            )
+        if self._policy_action_horizon is not None and self._policy_action_horizon <= 0:
+            raise ValueError(
+                "POLICY_ACTION_HORIZON must be positive, "
+                f"got {self._policy_action_horizon}"
+            )
+
+    def _execution_horizon_for_chunk(self, chunk_size: int) -> int:
+        if chunk_size <= 0:
+            raise ValueError(f"Policy returned an empty action chunk: {chunk_size}")
+        if self._policy_execution_horizon is None:
+            return chunk_size
+        return min(chunk_size, self._policy_execution_horizon)
 
     @staticmethod
     def _rot6d_to_rpy(rot6d: np.ndarray, *, convention: str = "cols_rowmajor") -> np.ndarray:
@@ -130,8 +159,21 @@ class Psi0KimodoTextOpTrackerAgent(Psi0KimodoDecoupledWbcAgent):
             return converted
         raise ValueError(f"Expected policy action dim 44 or 59, got {policy_action.shape}")
 
-    def _policy44_to_textop_actions(self, policy_action: np.ndarray, instruction: str | None = None) -> list[ActionCmd]:
+    def _policy44_to_textop_actions(
+        self,
+        policy_action: np.ndarray,
+        instruction: str | None = None,
+        *,
+        execution_horizon: int | None = None,
+    ) -> list[ActionCmd]:
         policy_action = self._normalize_policy_action(policy_action)
+        if execution_horizon is None:
+            execution_horizon = policy_action.shape[0]
+        if execution_horizon <= 0 or execution_horizon > policy_action.shape[0]:
+            raise ValueError(
+                "execution_horizon must be in [1, action_chunk_size], "
+                f"got {execution_horizon} for chunk size {policy_action.shape[0]}"
+            )
         if self._textop_adapter is None:
             self._textop_adapter = TextOpTrackerAdapter(self.robot.mjModel)
 
@@ -142,7 +184,11 @@ class Psi0KimodoTextOpTrackerAgent(Psi0KimodoDecoupledWbcAgent):
             current_constraints28_mujoco=self._current_constraints28_mujoco(),
             instruction=instruction,
         )
-        self._last_kimodo_qpos_mujoco = qpos50[-1].copy()
+        # Kimodo and TextOp need the complete policy chunk so their future
+        # reference remains 40 frames long.  Only the first execution_horizon
+        # frames are consumed before replanning; the remaining tail belongs to
+        # Prefix-RTC overlap and must not be executed by this chunk.
+        self._last_kimodo_qpos_mujoco = qpos50[execution_horizon - 1].copy()
         init_hold_action = None
         if self._init_to_ref and not self._did_init_to_ref:
             self.robot.mjData.qpos[:7] = qpos50[0, :7]
@@ -159,6 +205,7 @@ class Psi0KimodoTextOpTrackerAgent(Psi0KimodoDecoupledWbcAgent):
                 target_q=np.asarray(qpos50[0, 7:36], dtype=np.float32),
                 left_hand_q=np.asarray(hand14[0, :7], dtype=np.float32),
                 right_hand_q=np.asarray(hand14[0, 7:14], dtype=np.float32),
+                debug_reference_qpos36=np.asarray(qpos50[0, :36], dtype=np.float32),
             )
         if self._use_policy_root_ee:
             root6 = np.asarray(policy_action[:, 14:20], dtype=np.float32)
@@ -169,8 +216,15 @@ class Psi0KimodoTextOpTrackerAgent(Psi0KimodoDecoupledWbcAgent):
         actions = []
         if init_hold_action is not None:
             actions.append(init_hold_action)
-        for t, hand_q in enumerate(hand14):
-            actions.append((ref, t, np.asarray(hand_q, dtype=np.float32)))
+        for t, hand_q in enumerate(hand14[:execution_horizon]):
+            actions.append(
+                (
+                    ref,
+                    t,
+                    np.asarray(hand_q, dtype=np.float32),
+                    np.asarray(qpos50[t, :36], dtype=np.float32),
+                )
+            )
         return actions
 
     def _rate_limit_body_target(self, body_target: np.ndarray) -> np.ndarray:
@@ -197,7 +251,11 @@ class Psi0KimodoTextOpTrackerAgent(Psi0KimodoDecoupledWbcAgent):
     def _make_textop_action(self, item) -> ActionCmd:
         if isinstance(item, ActionCmd):
             return item
-        ref, t, hand_q = item
+        if len(item) == 4:
+            ref, t, hand_q, debug_reference_qpos36 = item
+        else:
+            ref, t, hand_q = item
+            debug_reference_qpos36 = None
         raw_body_q = self._textop_adapter.target_from_reference(ref, self.robot.mjData, t)
         body_q = self._rate_limit_body_target(raw_body_q)
         if self._debug and t == 0:
@@ -207,6 +265,11 @@ class Psi0KimodoTextOpTrackerAgent(Psi0KimodoDecoupledWbcAgent):
             target_q=np.asarray(body_q, dtype=np.float32),
             left_hand_q=np.asarray(hand_q[:7], dtype=np.float32),
             right_hand_q=np.asarray(hand_q[7:14], dtype=np.float32),
+            debug_reference_qpos36=(
+                None
+                if debug_reference_qpos36 is None
+                else np.asarray(debug_reference_qpos36, dtype=np.float32)
+            ),
         )
 
     def _dump_final_target_debug(self, raw_targets: np.ndarray, final_targets: np.ndarray) -> None:
@@ -253,8 +316,27 @@ class Psi0KimodoTextOpTrackerAgent(Psi0KimodoDecoupledWbcAgent):
                 history=history,
                 dataset="simple",
             )
-            print(f"Received {policy_action.shape[0]} Kimodo-policy actions for TextOp tracker.")
-            self._direct_queue.extend(self._policy44_to_textop_actions(policy_action, instruction=instruction))
+            chunk_size = int(policy_action.shape[0])
+            expected_chunk_size = getattr(self, "_policy_action_horizon", None)
+            if expected_chunk_size is not None and chunk_size != expected_chunk_size:
+                raise ValueError(
+                    "Policy action chunk does not match the VLA->Kimodo->TextOp contract: "
+                    f"received={chunk_size}, expected={expected_chunk_size}"
+                )
+            execution_horizon = self._execution_horizon_for_chunk(chunk_size)
+            overlap = chunk_size - execution_horizon
+            print(
+                f"Received {chunk_size} Kimodo-policy actions for TextOp tracker; "
+                f"queueing {execution_horizon} before replanning "
+                f"(Prefix-RTC overlap={overlap})."
+            )
+            self._direct_queue.extend(
+                self._policy44_to_textop_actions(
+                    policy_action,
+                    instruction=instruction,
+                    execution_horizon=execution_horizon,
+                )
+            )
 
         self._last_pred_action = self._make_textop_action(self._direct_queue.pop(0))
         self._record_debug_trace()

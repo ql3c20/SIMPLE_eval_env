@@ -10,6 +10,7 @@ class SIM_MODE(Enum):
     MUJOCO = "mujoco"
     ISAAC = "isaac"
     MUJOCO_ISAAC = "mujoco_isaac"
+    MUJOCO_EXTERNAL_ISAAC = "mujoco_external_isaac"
 
 from gymnasium.envs.registration import register
 
@@ -406,6 +407,36 @@ register(
     id="simple/G1Fullstate20260615Task1-v0",
     entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
     kwargs={"task": "g1_fullstate_20260615_task1"},
+)
+
+register(
+    id="simple/G1Fullstate20260805Task2-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_20260805_task2"},
+)
+
+register(
+    id="simple/G1Fullstate20260804Task3-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_20260804_task3"},
+)
+
+register(
+    id="simple/G1Fullstate20260729Task4-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_20260729_task4"},
+)
+
+register(
+    id="simple/G1Fullstate20260825Task5-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_20260825_task5"},
+)
+
+register(
+    id="simple/G1Fullstate20260828Task6-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_20260828_task6"},
 )
 
 register(

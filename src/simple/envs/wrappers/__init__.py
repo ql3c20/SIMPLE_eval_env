@@ -8,4 +8,7 @@ Licensed under the terms in LICENSE file.
 from .policy_debugger import PolicyDebugger
 from .video_recorder import VideoRecorder
 from .episode_extractor import EpisodeExtractor
-from .data_recoder import DataRecorder
+try:
+    from .data_recoder import DataRecorder
+except ImportError:  # Optional envlogger/riegeli runtime is not needed for eval.
+    DataRecorder = None  # type: ignore[assignment]

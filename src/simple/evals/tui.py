@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import sys
+import time
 
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -22,6 +23,8 @@ class WorkerProgress:
     setup_seconds: float | None = None
     last_episode_seconds: float | None = None
     last_steps_per_second: float | None = None
+    total_episode_seconds: float = 0.0
+    started_monotonic: float = 0.0
 
 
 def make_console(stream=None) -> Console:
@@ -74,6 +77,8 @@ def update_progress(
     event = payload["event"]
 
     if event == "worker_init":
+        if state.started_monotonic == 0.0:
+            state.started_monotonic = time.monotonic()
         state.total_episodes = int(payload["total_episodes"])
         state.status = str(payload.get("status", "running"))
         if "setup_seconds" in payload:
@@ -95,6 +100,7 @@ def update_progress(
         state.successes = int(payload["successes"])
         if "episode_seconds" in payload:
             state.last_episode_seconds = float(payload["episode_seconds"])  # type: ignore[arg-type]
+            state.total_episode_seconds += state.last_episode_seconds
         if "steps_per_second" in payload:
             state.last_steps_per_second = float(payload["steps_per_second"])  # type: ignore[arg-type]
         state.status = "running"
@@ -130,6 +136,21 @@ def render_progress(
     avg_setup = f"{sum(setup_values) / len(setup_values):.1f}s" if setup_values else "-"
     avg_episode = f"{sum(episode_values) / len(episode_values):.1f}s" if episode_values else "-"
     avg_sps = f"{sum(sps_values) / len(sps_values):.1f}" if sps_values else "-"
+    total_episode_seconds = sum(state.total_episode_seconds for state in worker_states.values())
+    average_episode_seconds = (
+        total_episode_seconds / total_completed if total_completed else 0.0
+    )
+    eta_seconds = average_episode_seconds * max(total_assigned - total_completed, 0)
+    elapsed_starts = [
+        state.started_monotonic for state in worker_states.values() if state.started_monotonic > 0
+    ]
+    elapsed_seconds = time.monotonic() - min(elapsed_starts) if elapsed_starts else 0.0
+
+    def duration(value: float) -> str:
+        total = max(0, int(round(value)))
+        hours, remainder = divmod(total, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     summary = Table.grid(expand=True)
     summary.add_column(ratio=1)
@@ -153,8 +174,9 @@ def render_progress(
     )
     summary.add_row(
         f"[dim]setup[/dim] {avg_setup}  [dim]ep[/dim] {avg_episode}  [dim]step/s[/dim] {avg_sps}",
-        f"[dim]log[/dim] {log_path}",
+        f"[dim]elapsed[/dim] {duration(elapsed_seconds)}  [dim]ETA[/dim] {duration(eta_seconds)}",
     )
+    summary.add_row(f"[dim]log[/dim] {log_path}", "")
 
     workers = Table(
         expand=True,

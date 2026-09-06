@@ -191,6 +191,20 @@ class MujocoSimulator(Simulator):
 
         for extra in getattr(self.task, "mujoco_extra_mjcf", []):
             child = mujoco.MjSpec.from_file(str(extra["path"]))
+            scale = float(extra.get("scale", 1.0))
+            if scale <= 0.0:
+                raise ValueError(f"Extra MJCF scale must be positive, got {scale}")
+            if scale != 1.0:
+                for mesh in child.meshes:
+                    mesh.scale[:] = np.asarray(mesh.scale) * scale
+                for body in child.bodies:
+                    body.pos[:] = np.asarray(body.pos) * scale
+                for geom in child.geoms:
+                    geom.pos[:] = np.asarray(geom.pos) * scale
+                    geom.size[:] = np.asarray(geom.size) * scale
+                for site in child.sites:
+                    site.pos[:] = np.asarray(site.pos) * scale
+                    site.size[:] = np.asarray(site.size) * scale
             freejoint_body = extra.get("freejoint_body")
             if freejoint_body:
                 body = next(
@@ -306,6 +320,18 @@ class MujocoSimulator(Simulator):
                 )
             self.mjData.qpos[: initial_qpos.size] = initial_qpos
             self.mjData.qvel[:] = 0.0
+
+        for joint_name, value in getattr(
+            self.task, "mujoco_initial_joint_qpos", {}
+        ).items():
+            joint_qpos = self.mjData.joint(joint_name).qpos
+            values = np.asarray(value, dtype=np.float64).reshape(-1)
+            if values.size != joint_qpos.size:
+                raise ValueError(
+                    f"Initial qpos for {joint_name} has {values.size} values, "
+                    f"expected {joint_qpos.size}"
+                )
+            joint_qpos[:] = values
         
         
         if self.articulated_object_joints is not None:
