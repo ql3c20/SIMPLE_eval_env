@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -202,6 +203,19 @@ DEFAULT_ANGLES = np.asarray([_joint_default(n) for n in MUJOCO_JOINT_NAMES], dty
 ACTION_SCALE = np.asarray([_action_scale(n) for n in MUJOCO_JOINT_NAMES], dtype=np.float32)
 
 
+@dataclass(frozen=True)
+class TextOpRobotState:
+    """Simulator-independent online state consumed by the TextOp tracker."""
+
+    pelvis_pos_w: np.ndarray
+    pelvis_quat_wxyz: np.ndarray
+    projected_gravity_b: np.ndarray
+    base_lin_vel_b: np.ndarray
+    base_ang_vel_b: np.ndarray
+    joint_pos_isaaclab: np.ndarray
+    joint_vel_isaaclab: np.ndarray
+
+
 def _quat_inv(q: np.ndarray) -> np.ndarray:
     out = q.copy()
     out[..., 1:] *= -1.0
@@ -296,13 +310,12 @@ def _subtract_frame(pos_a: np.ndarray, quat_a: np.ndarray, pos_b: np.ndarray, qu
 
 
 class TextOpTrackerAdapter:
-    def __init__(self, mj_model, *, policy_onnx: Path | None = None, vae_onnx: Path | None = None):
-        import mujoco
+    def __init__(self, mj_model=None, *, policy_onnx: Path | None = None, vae_onnx: Path | None = None):
         import onnxruntime as ort
 
-        self.mujoco = mujoco
+        self.mujoco = None
         self.model = mj_model
-        self.data = mujoco.MjData(mj_model)
+        self.data = None
         self.task = TEXTOP_TASK
         self.future_steps = FUTURE_STEPS
         self.vae_window_steps = VAE_WINDOW_STEPS
@@ -325,20 +338,29 @@ class TextOpTrackerAdapter:
             f"expected_obs_dim={self.expected_obs_dim}"
         )
 
-        self.body_ids = [mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, n) for n in DEFAULT_BODY_NAMES]
-        self.ee_body_ids = [mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, n) for n in DEFAULT_EE_BODY_NAMES]
-        if min(self.body_ids + self.ee_body_ids) < 0:
-            raise ValueError("Missing TextOp body name in MuJoCo model")
-        self.body_qpos_adrs = []
-        self.body_qvel_adrs = []
-        for name in MUJOCO_JOINT_NAMES:
-            joint_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_JOINT, name)
-            if joint_id < 0:
-                raise ValueError(f"Missing TextOp joint name in MuJoCo model: {name}")
-            self.body_qpos_adrs.append(int(mj_model.jnt_qposadr[joint_id]))
-            self.body_qvel_adrs.append(int(mj_model.jnt_dofadr[joint_id]))
-        self.body_qpos_adrs = np.asarray(self.body_qpos_adrs, dtype=np.int32)
-        self.body_qvel_adrs = np.asarray(self.body_qvel_adrs, dtype=np.int32)
+        self.body_ids = []
+        self.ee_body_ids = []
+        self.body_qpos_adrs = np.asarray([], dtype=np.int32)
+        self.body_qvel_adrs = np.asarray([], dtype=np.int32)
+        if mj_model is not None:
+            import mujoco
+
+            self.mujoco = mujoco
+            self.data = mujoco.MjData(mj_model)
+            self.body_ids = [mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, n) for n in DEFAULT_BODY_NAMES]
+            self.ee_body_ids = [mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, n) for n in DEFAULT_EE_BODY_NAMES]
+            if min(self.body_ids + self.ee_body_ids) < 0:
+                raise ValueError("Missing TextOp body name in MuJoCo model")
+            body_qpos_adrs = []
+            body_qvel_adrs = []
+            for name in MUJOCO_JOINT_NAMES:
+                joint_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                if joint_id < 0:
+                    raise ValueError(f"Missing TextOp joint name in MuJoCo model: {name}")
+                body_qpos_adrs.append(int(mj_model.jnt_qposadr[joint_id]))
+                body_qvel_adrs.append(int(mj_model.jnt_dofadr[joint_id]))
+            self.body_qpos_adrs = np.asarray(body_qpos_adrs, dtype=np.int32)
+            self.body_qvel_adrs = np.asarray(body_qvel_adrs, dtype=np.int32)
 
         providers = ["CPUExecutionProvider"]
         if "CUDAExecutionProvider" in ort.get_available_providers():
@@ -442,10 +464,42 @@ class TextOpTrackerAdapter:
         self.last_action = action.astype(np.float32)
         return target.astype(np.float32)
 
+    def target_from_reference_state(
+        self,
+        ref: dict[str, np.ndarray],
+        robot_state: TextOpRobotState,
+        t: int,
+    ) -> np.ndarray:
+        """Run TextOp from an Isaac/other simulator state; return MuJoCo-order body29."""
+        obs = self._obs_from_state(
+            robot_state,
+            ref["qpos36"],
+            ref["body_pos"],
+            ref["body_quat"],
+            ref["latents"],
+            t,
+            anchor_pos=ref.get("anchor_pos"),
+            anchor_quat=ref.get("anchor_quat"),
+            ee_pos=ref.get("ee_pos"),
+            ee_quat=ref.get("ee_quat"),
+        )
+        action = self.policy_session.run(
+            None,
+            {self.policy_input: obs.reshape(1, -1).astype(np.float32)},
+        )[0].reshape(-1)
+        target = action[ISAACLAB_TO_MUJOCO] * ACTION_SCALE + DEFAULT_ANGLES
+        self.last_action = action.astype(np.float32)
+        return target.astype(np.float32)
+
     def reset(self):
         self.last_action[:] = 0.0
 
     def _fk_chunk(self, qpos36: np.ndarray):
+        if self.data is None or self.mujoco is None:
+            raise RuntimeError(
+                "prepare_reference requires a MuJoCo model; use prepare_reference_external "
+                "for simulator-independent tracking"
+            )
         pos = np.empty((len(qpos36), len(DEFAULT_BODY_NAMES), 3), dtype=np.float32)
         quat = np.empty((len(qpos36), len(DEFAULT_BODY_NAMES), 4), dtype=np.float32)
         for i, qpos in enumerate(qpos36):
@@ -493,8 +547,46 @@ class TextOpTrackerAdapter:
         ee_pos=None,
         ee_quat=None,
     ) -> np.ndarray:
-        robot_pos = sim_data.body("pelvis").xpos.copy()
-        robot_quat = sim_data.body("pelvis").xquat.copy()
+        robot_state = TextOpRobotState(
+            pelvis_pos_w=sim_data.body("pelvis").xpos.copy(),
+            pelvis_quat_wxyz=sim_data.body("pelvis").xquat.copy(),
+            projected_gravity_b=self._projected_gravity(sim_data),
+            base_lin_vel_b=_quat_apply(_quat_inv(sim_data.qpos[3:7]), sim_data.qvel[0:3]).astype(np.float32),
+            base_ang_vel_b=sim_data.qvel[3:6].astype(np.float32),
+            joint_pos_isaaclab=(
+                sim_data.qpos[self.body_qpos_adrs] - DEFAULT_ANGLES
+            )[MUJOCO_TO_ISAACLAB].astype(np.float32),
+            joint_vel_isaaclab=sim_data.qvel[self.body_qvel_adrs][MUJOCO_TO_ISAACLAB].astype(np.float32),
+        )
+        return self._obs_from_state(
+            robot_state,
+            qpos36,
+            body_pos,
+            body_quat,
+            latents,
+            t,
+            anchor_pos=anchor_pos,
+            anchor_quat=anchor_quat,
+            ee_pos=ee_pos,
+            ee_quat=ee_quat,
+        )
+
+    def _obs_from_state(
+        self,
+        robot_state: TextOpRobotState,
+        qpos36,
+        body_pos,
+        body_quat,
+        latents,
+        t: int,
+        *,
+        anchor_pos=None,
+        anchor_quat=None,
+        ee_pos=None,
+        ee_quat=None,
+    ) -> np.ndarray:
+        robot_pos = np.asarray(robot_state.pelvis_pos_w, dtype=np.float32).reshape(3)
+        robot_quat = np.asarray(robot_state.pelvis_quat_wxyz, dtype=np.float32).reshape(4)
         fut = np.clip(t + np.arange(self.motion_future_steps), 0, len(qpos36) - 1)
 
         if anchor_pos is None:
@@ -529,11 +621,11 @@ class TextOpTrackerAdapter:
             _matrix_rows6_from_quat(anchor_quat_b).reshape(-1),
             robot_pos.astype(np.float32),
             _matrix_rows6_from_quat(robot_quat[None]).reshape(-1),
-            self._projected_gravity(sim_data),
-            _quat_apply(_quat_inv(sim_data.qpos[3:7]), sim_data.qvel[0:3]).astype(np.float32),
-            sim_data.qvel[3:6].astype(np.float32),
-            (sim_data.qpos[self.body_qpos_adrs] - DEFAULT_ANGLES)[MUJOCO_TO_ISAACLAB].astype(np.float32),
-            sim_data.qvel[self.body_qvel_adrs][MUJOCO_TO_ISAACLAB].astype(np.float32),
+            np.asarray(robot_state.projected_gravity_b, dtype=np.float32).reshape(3),
+            np.asarray(robot_state.base_lin_vel_b, dtype=np.float32).reshape(3),
+            np.asarray(robot_state.base_ang_vel_b, dtype=np.float32).reshape(3),
+            np.asarray(robot_state.joint_pos_isaaclab, dtype=np.float32).reshape(NUM_ACTIONS),
+            np.asarray(robot_state.joint_vel_isaaclab, dtype=np.float32).reshape(NUM_ACTIONS),
             self.last_action.astype(np.float32),
             ee_pos_b.reshape(-1),
             _matrix_rows6_from_quat(ee_quat_b).reshape(-1),

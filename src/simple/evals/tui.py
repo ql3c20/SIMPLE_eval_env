@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass
 import os
 import sys
@@ -29,10 +30,19 @@ def make_console(stream=None) -> Console:
     return Console(file=stream, force_terminal=stream.isatty(), no_color=not stream.isatty())
 
 
-def restore_cursor(console: Console) -> None:
+_TERMINAL_RESTORE_SEQUENCE = "\x1b[0m\x1b[?25h"
+
+
+def restore_cursor(console: Console | None = None) -> None:
     streams = []
 
-    for stream in (getattr(console, "file", None), sys.stderr, sys.__stderr__, sys.stdout, sys.__stdout__):
+    for stream in (
+        getattr(console, "file", None),
+        sys.stderr,
+        sys.__stderr__,
+        sys.stdout,
+        sys.__stdout__,
+    ):
         if stream is None:
             continue
         if stream in streams:
@@ -40,23 +50,31 @@ def restore_cursor(console: Console) -> None:
         streams.append(stream)
 
     try:
-        console.show_cursor(True)
+        if console is not None:
+            console.show_cursor(True)
     except Exception:
         pass
 
     for stream in streams:
         try:
-            stream.write("\x1b[?25h")
+            stream.write(_TERMINAL_RESTORE_SEQUENCE)
             stream.flush()
         except Exception:
             pass
 
     try:
-        with open("/dev/tty", "w", buffering=1) as tty:
-            tty.write("\x1b[?25h")
-            tty.flush()
+        tty_fd = os.open("/dev/tty", os.O_WRONLY | getattr(os, "O_NOCTTY", 0))
+        try:
+            os.write(tty_fd, _TERMINAL_RESTORE_SEQUENCE.encode())
+        finally:
+            os.close(tty_fd)
     except Exception:
         pass
+
+
+def register_cursor_restore(console: Console) -> None:
+    """Restore the terminal after late simulator/interpreter shutdown hooks."""
+    atexit.register(restore_cursor, console)
 
 
 def format_episode_label(value: str) -> str:

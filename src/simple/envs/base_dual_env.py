@@ -70,7 +70,9 @@ class BaseDualSim(gym.Env):
         
         from simple.engines import MujocoSimulator
         self.mujoco = MujocoSimulator(self.task, headless=("isaac" in self.sim_mode) or headless)
-        self.task = TaskRegistry.make(task, *args, **kwargs) if isinstance(task, str) else task
+        # Both simulators and the environment must share the same task instance.
+        # Re-creating it here made reset-time layout/recording configuration
+        # invisible to the engines.
         
         self.action_space = self.task.action_space
         self.observation_space = self.task.observation_space

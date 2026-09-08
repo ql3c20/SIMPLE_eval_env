@@ -26,13 +26,16 @@ import numpy as np
 from torch._tensor import Tensor
 import transforms3d as t3d
 
+_CUROBO_IMPORT_ERROR: ImportError | None = None
 try:
     from curobo.types.base import TensorDeviceType
     from curobo.types.robot import RobotConfig
     from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
     from curobo.util_file import join_path
-except ImportError:
-    raise RuntimeError("curobo not installed, uv pip install --groups curobo")
+except ImportError as exc:
+    # Aloha IK/FK needs CuRobo, but importing unrelated MuJoCo-only tasks does
+    # not. Defer the error until an Aloha CuRobo operation is actually used.
+    _CUROBO_IMPORT_ERROR = exc
 
 @RobotRegistry.register("aloha")
 class Aloha(CuRoboMixin, WristCamMountable, Robot, DualArm):

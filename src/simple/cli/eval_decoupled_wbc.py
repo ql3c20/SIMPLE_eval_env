@@ -29,25 +29,18 @@ from rich.live import Live
 from typing_extensions import Annotated
 
 import simple.envs as _  # noqa: F401
-from simple.envs.wrappers import VideoRecorder
+from simple.envs.wrappers import VideoRecorder, task_video_recorder_options
 from simple.evals.api import EvalConfig, EvalResult
+from simple.evals.stats import EvalStatsProgress, append_eval_stats_line
 from simple.evals.tui import (
     WorkerProgress,
     make_console,
+    register_cursor_restore,
     render_progress,
     restore_cursor,
     update_progress,
 )
 from simple.utils import snake_to_pascal
-
-
-def _append_eval_stats_line(eval_dir: str, line: str) -> None:
-    path = Path(eval_dir) / "eval_stats.txt"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", buffering=1) as f:
-        f.write(line)
-        f.flush()
-        os.fsync(f.fileno())
 
 
 def _root_roll_pitch_from_wxyz(quat) -> tuple[float, float]:
@@ -323,9 +316,9 @@ def _run_eval_worker(
             env = VideoRecorder(
                 env=raw_env,
                 video_folder=eval_output_dir,
-                name_prefix=task_id,
                 framerate=render_hz,
                 write_png=False,
+                **task_video_recorder_options(task, eps_idx),
             )
         else:
             env = raw_env
@@ -409,10 +402,11 @@ def _run_eval_worker(
         stats[task_id] = is_success
         episode_seconds = time.perf_counter() - episode_start_time
         suffix = f" fall_stop={fall_stop_reason}" if fall_stop_reason else ""
-        _append_eval_stats_line(eval_dir, f"{task_id}: {is_success}{suffix} \n")
+        append_eval_stats_line(eval_dir, f"{task_id}: {is_success}{suffix} \n")
         report(
             "episode_end",
             episode=task_id,
+            success=is_success,
             step=frame_idx,
             completed_episodes=len(stats),
             successes=sum(stats.values()),
@@ -427,13 +421,15 @@ def _run_eval_worker(
 
     persist_payload("ok", dict(stats))
     report("worker_status", status="closing")
-    raw_env.close()
-    persist_payload("ok", dict(stats))
     report(
         "worker_done",
         completed_episodes=len(stats),
         successes=sum(stats.values()),
     )
+    # Persist the worker result and final progress event before simulator
+    # teardown. IsaacSim shutdown can take minutes or be interrupted after all
+    # requested episodes have already completed.
+    raw_env.close()
     return stats
 
 
@@ -483,9 +479,11 @@ def run_eval(
     if num_workers == 1 and show_progress:
         terminal_stream = os.fdopen(os.dup(2), "w", buffering=1)
     console = make_console(terminal_stream)
+    register_cursor_restore(console)
     worker_states = {wid: WorkerProgress() for wid in range(num_workers)}
-    _append_eval_stats_line(eval_dir, "================\n")
-    _append_eval_stats_line(eval_dir, f"run: {env_id} - {policy}\n")
+    stats_progress = EvalStatsProgress(eval_dir, num_workers)
+    append_eval_stats_line(eval_dir, "================\n")
+    append_eval_stats_line(eval_dir, f"run: {env_id} - {policy}\n")
 
     worker_kwargs = dict(
         env_id=env_id,
@@ -522,6 +520,7 @@ def run_eval(
                 ):
 
                     def report(payload: dict[str, Any]) -> None:
+                        stats_progress.handle(0, payload)
                         update_progress(worker_states, 0, payload)
                         live.update(
                             render_progress(env_id, policy, worker_states, log_path),
@@ -537,10 +536,15 @@ def run_eval(
             finally:
                 restore_cursor(console)
         else:
+
+            def report_without_tui(payload: dict[str, Any]) -> None:
+                stats_progress.handle(0, payload)
+
             stats = _run_eval_worker(
                 **worker_kwargs,
                 worker_id=0,
                 num_workers=1,
+                progress_reporter=report_without_tui,
             )
     else:
         ctx = mp.get_context("spawn")
@@ -591,6 +595,7 @@ def run_eval(
                                     del progress_readers[key]
                                     break
                             continue
+                        stats_progress.handle(wid, payload)
                         update_progress(worker_states, wid, payload)
                         if show_progress:
                             live.update(
@@ -680,11 +685,9 @@ def run_eval(
             )
             raise typer.Exit(code=1)
 
-    sr = sum(stats.values()) / len(stats) if stats else 0.0
+    sr = stats_progress.ensure_final(stats)
     console.print(f"Success rate {env_id} - {policy}: {sr:.2%}")
     console.print(f"Eval log: {log_path}")
-
-    _append_eval_stats_line(eval_dir, f"success rate: {sr:.2f} \n")
     if terminal_stream is not None:
         terminal_stream.close()
     return EvalResult(

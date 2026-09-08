@@ -28,7 +28,7 @@ from rich.live import Live
 from typing_extensions import Annotated
 
 import simple.envs as _  # noqa: F401
-from simple.envs.wrappers import VideoRecorder
+from simple.envs.wrappers import VideoRecorder, task_video_recorder_options
 from simple.evals.api import EvalConfig, EvalResult
 from simple.evals.tui import (
     WorkerProgress,
@@ -268,9 +268,9 @@ def _run_eval_worker(
             env = VideoRecorder(
                 env=raw_env,
                 video_folder=eval_output_dir,
-                name_prefix=task_id,
                 framerate=render_hz,
                 write_png=False,
+                **task_video_recorder_options(task, eps_idx),
             )
         else:
             env = raw_env

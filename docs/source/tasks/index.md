@@ -7,3 +7,4 @@
 
 franka_tabletop_grasp
 aloha_tabletop_grasp
+task234_mujoco_isaac_eval

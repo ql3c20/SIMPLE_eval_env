@@ -17,6 +17,7 @@ import torch
 import numpy as np
 # from simple.mp.curobo import CuRoboPlanner
 
+_CUROBO_IMPORT_ERROR: ImportError | None = None
 try:
     # import curobo
     from curobo.types.base import TensorDeviceType
@@ -25,8 +26,15 @@ try:
     from curobo.types.robot import RobotConfig
     from curobo.util_file import join_path
     from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
-except ImportError:
-    raise RuntimeError("curobo not installed, uv pip install --groups curobo")
+except ImportError as exc:
+    _CUROBO_IMPORT_ERROR = exc
+
+
+def _require_curobo() -> None:
+    if _CUROBO_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "CuRobo is required for IK/FK and motion planning but is not installed"
+        ) from _CUROBO_IMPORT_ERROR
 
 
 class CuRoboMixin(BatchPlannable, Controllable, Graspable, HasKinematics):
@@ -62,6 +70,7 @@ class CuRoboMixin(BatchPlannable, Controllable, Graspable, HasKinematics):
         @param qpos: list of joint positions
         @return: hand_pose: (position, quaternion)
         """
+        _require_curobo()
         if isinstance(qpos, dict):
             qpos_list = []
             for jname in self.kin_model.joint_names:
@@ -82,6 +91,7 @@ class CuRoboMixin(BatchPlannable, Controllable, Graspable, HasKinematics):
             inverse kinematics implmented by curobo
             required by agents using (delta) eef control such as OpenVLA, Octo, etc.
         """
+        _require_curobo()
         ik_solver = self._create_empty_world_ik_solver()
         
         tensor_args = TensorDeviceType()
@@ -129,6 +139,7 @@ class CuRoboMixin(BatchPlannable, Controllable, Graspable, HasKinematics):
         Returns:
             position (3D np.ndarray), orientation (quaternion as 4D np.ndarray)
         """
+        _require_curobo()
         robot = cast("Robot", self)
         if not isinstance(joint_qpos, dict):
             joint_qpos = dict(zip(robot.joint_names, joint_qpos))
@@ -154,6 +165,7 @@ class CuRoboMixin(BatchPlannable, Controllable, Graspable, HasKinematics):
         return np.concatenate(hand_pose, axis=0).tolist()
     
     def _get_kinematic_model(self): # TODO DO NOT PUBLIC THIS FUNCTION
+        _require_curobo()
         if self._kin_model is None:
             robot = cast("Robot", self)
             assert isinstance(robot.robot_cfg, dict)
@@ -175,6 +187,7 @@ class CuRoboMixin(BatchPlannable, Controllable, Graspable, HasKinematics):
         return self._kin_model
     
     def _create_empty_world_ik_solver(self): # TODO DO NOT PUBLIC THIS FUNCTION
+        _require_curobo()
         robot = cast("Robot", self)
         if self._ik_solver is None:
             ik_solver = IKSolver(IKSolver.load_from_robot_config(
@@ -185,4 +198,3 @@ class CuRoboMixin(BatchPlannable, Controllable, Graspable, HasKinematics):
             ))
             self._ik_solver = ik_solver
         return self._ik_solver
-

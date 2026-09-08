@@ -160,8 +160,10 @@ class SonicLocoManipEnv(BaseDualSim):
 
             # with self._telemetry.timer("mujoco.step"):
             self.mujoco.step(render=False) # FIXME  # only render on last step
-            if self.isaac:
-                self.isaac.step(self.mujoco)
+        if self.isaac:
+            # MuJoCo may take several internal physics substeps, while the
+            # read-only Isaac mirror renders once per 50 Hz control step.
+            self.isaac.step(self.mujoco)
         
         self.step_count += 1
         # with self._telemetry.timer("env._get_obs"):
@@ -199,11 +201,10 @@ class SonicLocoManipEnv(BaseDualSim):
         return self._render_frame()
 
     def _render_frame(self):
-        frame_mujoco = self.mujoco.render()
-
         if self.isaac:
             frame_isaac = self.isaac.render()
             if "debug" in self.task.metadata and self.task.metadata["debug"]:
+                frame_mujoco = self.mujoco.render()
                 # tile frame_mujoco and frame isaac together
                 frame_tiled = {}
                 for key, isaac_img in frame_isaac.items():
@@ -214,9 +215,12 @@ class SonicLocoManipEnv(BaseDualSim):
                     ], axis=1)
                 return frame_tiled
             else:
+                # In dual-sim eval the policy image is exclusively the Isaac
+                # Ego render product.  Do not silently render/fall back to a
+                # MuJoCo camera.
                 return frame_isaac
         else:
-            return frame_mujoco
+            return self.mujoco.render()
 
     def close(self):
         if self.viewer is not None:

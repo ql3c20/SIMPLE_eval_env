@@ -94,7 +94,10 @@ class G1Fullstate20260615Task1(G1WholebodyXMovePickTaskTeleop):
     }
 
     _humanoid_vla_root = Path(
-        os.environ.get("HUMANOID_VLA_MJ_ROOT", "/pfs/pfs-ilWc5D/yzh/HumanoidVLA_MJ")
+        os.environ.get(
+            "HUMANOID_VLA_MJ_ROOT",
+            "/pfs/pfs-oHNwH0/mnt/pfs/humanoid/yzh/HumanoidVLA_MJ",
+        )
     )
     _asset_root = (
         _humanoid_vla_root
@@ -120,6 +123,7 @@ class G1Fullstate20260615Task1(G1WholebodyXMovePickTaskTeleop):
     ]
     mujoco_object_body_names = {"target": "task1_cylinder_object"}
     initial_target_height = 0.8249867
+    _nominal_cylinder_pos = np.asarray([1.05, 0.0, 0.825], dtype=np.float64)
     # First recorded robot qpos row from 20260615_141610_g1_sim/data.csv.
     # Ordering matches the G1 Sonic MJCF: floating root + 43 actuated joints.
     mujoco_initial_robot_qpos = [
@@ -151,6 +155,42 @@ class G1Fullstate20260615Task1(G1WholebodyXMovePickTaskTeleop):
             position=[0.0, 0.0, 0.0],
             quaternion=[1.0, 0.0, 0.0, 0.0],
         )
+
+        # Optional small object randomization for fixed-task robustness tests.
+        # Keep it opt-in so the default task exactly matches the recorded
+        # 20260615 initialization.  The ranges are intentionally narrow: the
+        # learned policy was trained for a table-top cylinder near this nominal
+        # location, not for arbitrary table positions.
+        reset_index = int(getattr(self, "_task1_reset_index", 0))
+        self._task1_reset_index = reset_index + 1
+        cylinder_pos = self._nominal_cylinder_pos.copy()
+        if os.environ.get("TASK1_RANDOMIZE_OBJECT", "0") == "1":
+            seed_base = int(os.environ.get("TASK1_OBJECT_SEED", "0"))
+            rng = np.random.default_rng(seed_base + reset_index)
+            x_range = np.fromstring(
+                os.environ.get("TASK1_OBJECT_X_RANGE", "1.00,1.10"),
+                sep=",",
+                dtype=np.float64,
+            )
+            y_range = np.fromstring(
+                os.environ.get("TASK1_OBJECT_Y_RANGE", "-0.05,0.05"),
+                sep=",",
+                dtype=np.float64,
+            )
+            if x_range.size != 2 or y_range.size != 2:
+                raise ValueError(
+                    "TASK1_OBJECT_X_RANGE and TASK1_OBJECT_Y_RANGE must be "
+                    "comma-separated min,max pairs"
+                )
+            cylinder_pos[0] = rng.uniform(float(x_range[0]), float(x_range[1]))
+            cylinder_pos[1] = rng.uniform(float(y_range[0]), float(y_range[1]))
+            print(
+                "[Task1ObjectRandomize] "
+                f"episode_reset={reset_index} "
+                f"pos=({cylinder_pos[0]:.4f}, {cylinder_pos[1]:.4f}, {cylinder_pos[2]:.4f})"
+            )
+        self.mujoco_extra_mjcf = copy.deepcopy(type(self).mujoco_extra_mjcf)
+        self.mujoco_extra_mjcf[1]["pos"] = cylinder_pos.tolist()
 
         camera_cfg = copy.deepcopy(self.sensor_cfgs["head_stereo"])
         self._layout.add_camera("head_stereo", camera_cfg)

@@ -409,6 +409,60 @@ register(
 )
 
 register(
+    id="simple/G1Fullstate20260625Task2-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_20260625_task2"},
+)
+
+register(
+    id="simple/G1Fullstate20260612Task3-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_20260612_task3"},
+)
+
+register(
+    id="simple/G1Fullstate20260729Task4-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_20260729_task4"},
+)
+
+register(
+    id="simple/G1Fullstate20260805Task2IsaacEval-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_20260805_task2_isaac_eval"},
+)
+
+register(
+    id="simple/G1Fullstate20260804Task3IsaacEval-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_20260804_task3_isaac_eval"},
+)
+
+register(
+    id="simple/G1Fullstate20260729Task4IsaacEval-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_20260729_task4_isaac_eval"},
+)
+
+register(
+    id="simple/G1FullstateArenaFootball-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_arena_football"},
+)
+
+register(
+    id="simple/G1FullstateArenaPPBox-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_arena_pp_box"},
+)
+
+register(
+    id="simple/G1FullstateArenaOpenDoor-v0",
+    entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
+    kwargs={"task": "g1_fullstate_arena_open_door"},
+)
+
+register(
     id="simple/G1WholebodyXMoveBendPickTeleop-v0",
     entry_point="simple.envs.sonic_loco_manip:SonicLocoManipEnv",
     kwargs={"task":"g1_wholebody_xmove_bend_pick_teleop"},

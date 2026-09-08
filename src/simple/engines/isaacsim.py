@@ -5,7 +5,7 @@ Copyright (c) 2025 Songlin Wei and Contributors
 Licensed under the terms in LICENSE file.
 """
 
-import copy
+import importlib.util
 import os
 from typing import Dict, Tuple
 
@@ -231,6 +231,9 @@ class IsaacSimSimulator(Simulator):
                 camera.initialize()
 
         self.is_isaac_reset = False
+        self._last_policy_frame_id = None
+        self._mirrored_frame_id = None
+        self._mirrored_mujoco_sim_time = None
 
     def _config_isaac(self):
         success, result = omni.kit.commands.execute('ChangeSetting',
@@ -269,6 +272,7 @@ class IsaacSimSimulator(Simulator):
         self.__update_robot()
         self.__update_cameras()
         self.__update_lights()
+        self.__update_task_visuals()
         self.update_visuals()
         
         # 5. add objects
@@ -322,8 +326,17 @@ class IsaacSimSimulator(Simulator):
         self.cameras = {}
         self.lights = []
         self.articulated_objects = {}
+        self.task_visuals = {}
+        self._missing_task_visual_paths = set()
 
         self.add_robot()
+        if getattr(self.task, "isaac_reproduction_spec", None) is not None:
+            self._recording_mujoco_model = self.task.isaac_mujoco_model
+            self.__add_recording_mjcf_visual()
+            # The recording-derived USD is the visible source of robot and
+            # task geometry.  Keep SIMPLE's generic articulation only as an
+            # internal joint-state adapter for existing observation code.
+            XFormPrim(prim_path=self.robot.prim_path).set_visibility(False)
         self.add_cameras()
         self.add_lights()
 
@@ -331,14 +344,17 @@ class IsaacSimSimulator(Simulator):
         self.spheres = None
 
     def __update_scene(self, move_surface_to_origin=True):
-        scene_uid = self.task.layout.scene.uid
+        scene = getattr(self.task.layout, "scene", None)
+        if scene is None:
+            return
+
+        scene_uid = scene.uid
 
         for uid, (_scene,_) in self.scenes.items():
             if scene_uid != uid:
                 _scene.GetAttribute("visibility").Set("invisible")
                 # scene.GetAttribute("xformOp:translate").Set((0, 0, 0))
 
-        scene = self.task.layout.scene
         assert isinstance(scene, HssdSuite), "not supported scene type yet"
 
         scene_prim_path = f"{self.SCENE_PRIM_PATH}/s_{scene.uid.replace(':', '_')}"
@@ -357,18 +373,30 @@ class IsaacSimSimulator(Simulator):
             #### START adding HSSD scenes ####
             from pxr import UsdGeom, UsdPhysics
 
-            # data_dir = resolve_data_path
-            try:
-                data_dir = resolve_data_path(scene.data_dir, auto_download=True) #f"scenes/hssd/{scene_name}" 
-            except FileNotFoundError:
-                # put download logic into SceneManager
-                from simple.scenes import SceneManager
-                SceneManager.get(scene.uid.split(":")[0]).load(scene.uid)
-                data_dir = resolve_data_path(scene.data_dir)
-
-            env_url = os.path.abspath(f"{data_dir}/{scene.name}.usd")
+            reproduction_spec = getattr(self.task, "isaac_reproduction_spec", None)
+            if reproduction_spec is not None:
+                # Scene13 deliberately uses 102344250_local.usd; deriving this
+                # filename from scene.name would load the wrong frozen asset.
+                env_url = os.path.abspath(
+                    resolve_data_path(
+                        reproduction_spec.hssd.usd_relative_path,
+                        auto_download=False,
+                    )
+                )
+            else:
+                # data_dir = resolve_data_path
+                try:
+                    data_dir = resolve_data_path(scene.data_dir, auto_download=True)
+                except FileNotFoundError:
+                    # put download logic into SceneManager
+                    from simple.scenes import SceneManager
+                    SceneManager.get(scene.uid.split(":")[0]).load(scene.uid)
+                    data_dir = resolve_data_path(scene.data_dir)
+                env_url = os.path.abspath(f"{data_dir}/{scene.name}.usd")
             isaacsim_stage.add_reference_to_stage(usd_path=env_url, prim_path=scene_prim_path)
             scene_prim = self.world.stage.GetPrimAtPath(scene_prim_path)
+            if reproduction_spec is not None:
+                self.__disable_prim_collisions(scene_prim)
 
             surface_prim = self.world.stage.GetPrimAtPath(surface_prim_path)
             surface_prim.GetAttribute("visibility").Set("invisible")
@@ -410,9 +438,54 @@ class IsaacSimSimulator(Simulator):
                 surface2_prim.GetAttribute("visibility").Set("invisible")
 
         ceiling = scene_prim.GetPrimAtPath(f"{scene_prim_path}/ceilings")
-        ceiling.GetAttribute("visibility").Set("visible") # hide ceiling for better visualization
+        if ceiling.IsValid() and ceiling.GetAttribute("visibility"):
+            ceiling.GetAttribute("visibility").Set("invisible")
 
-        if move_surface_to_origin:
+        reproduction_spec = getattr(self.task, "isaac_reproduction_spec", None)
+        if move_surface_to_origin and reproduction_spec is not None:
+            from omni.isaac.core.utils.bounds import (
+                compute_combined_aabb,
+                create_bbox_cache,
+            )
+
+            target = np.asarray(
+                reproduction_spec.hssd.target_surface_center, dtype=np.float64
+            )
+            surface_bounds_cache = create_bbox_cache()
+            surface_bounds = np.asarray(
+                compute_combined_aabb(surface_bounds_cache, surface_prim_path),
+                dtype=np.float64,
+            )
+            surface_center = 0.5 * (
+                surface_bounds[:3] + surface_bounds[3:]
+            )
+            room_offset = target - surface_center
+            scene_prim.GetAttribute("xformOp:translate").Set(tuple(room_offset))
+
+            # Recompute after surface alignment, then ground the visible room.
+            bounds_cache = create_bbox_cache()
+            room_bounds = np.asarray(
+                compute_combined_aabb(bounds_cache, scene_prim_path),
+                dtype=np.float64,
+            )
+            room_offset[2] -= float(room_bounds[2])
+            scene_prim.GetAttribute("xformOp:translate").Set(tuple(room_offset))
+
+            hidden_paths = (
+                reproduction_spec.hssd.hidden_prims
+                + ("floors",)
+            )
+            for relative_path in hidden_paths:
+                hidden = self.world.stage.GetPrimAtPath(
+                    f"{scene_prim_path}/{relative_path}"
+                )
+                if hidden.IsValid() and hidden.GetAttribute("visibility"):
+                    hidden.GetAttribute("visibility").Set("invisible")
+            print(
+                f"[Task{reproduction_spec.task_number}Reproduction] "
+                f"HSSD={env_url} room_offset={room_offset.tolist()}"
+            )
+        elif move_surface_to_origin:
             surface_center_position = - surface_obb["position"] + \
                 np.array(scene.center_offset, dtype=np.float32) #self._config.hssd.center_offset
             if self.task.robot.uid == "g1_sonic":
@@ -434,8 +507,12 @@ class IsaacSimSimulator(Simulator):
         for cname, cameraEntity in self.task.layout.cameras.items():
             p, q = cameraEntity.pose.position, cameraEntity.pose.quaternion
             isaacsim_camera = self.cameras[cname]
-            # isaacsim_camera.set_local_pose(p, [q[-1], q[0], q[1], q[2]]) # wxyz
-            isaacsim_camera.set_local_pose(p, q) # xyzw
+            # Isaac Sim's Camera API treats the quaternion as a world-camera
+            # frame by default and converts it to USD camera axes internally.
+            # Tasks that already provide an authored USD/OpenGL camera pose
+            # must opt out of that second conversion.
+            camera_axes = getattr(self.task, "isaac_camera_axes", "world")
+            isaacsim_camera.set_local_pose(p, q, camera_axes=camera_axes)
             isaacsim_camera.set_clipping_range(
                 cameraEntity.cam_cfg.near, cameraEntity.cam_cfg.far
             )
@@ -472,6 +549,350 @@ class IsaacSimSimulator(Simulator):
             light_prim.GetAttribute("inputs:intensity").Set(light_info.light_intensity)
             light_prim.GetAttribute("inputs:enableColorTemperature").Set(True)
             light_prim.GetAttribute("inputs:colorTemperature").Set(light_info.light_color_temperature)
+
+    def __resolve_task_usd_path(self, raw_path: str | os.PathLike) -> str:
+        raw_path = os.fspath(raw_path)
+        if os.path.isabs(raw_path):
+            if not os.path.exists(raw_path):
+                raise FileNotFoundError(raw_path)
+            return raw_path
+
+        if os.path.exists(raw_path):
+            return os.path.abspath(raw_path)
+
+        return os.path.abspath(resolve_data_path(raw_path.removeprefix("data/"), auto_download=True))
+
+    def __set_prim_pose_scale(
+        self,
+        prim_path: str,
+        position,
+        orientation=None,
+        scale=None,
+        visible: bool = True,
+    ) -> None:
+        xform = XFormPrim(prim_path=prim_path)
+        quat = [1.0, 0.0, 0.0, 0.0] if orientation is None else orientation
+        xform.set_local_pose(position, quat)
+        xform.set_visibility(visible)
+
+        if scale is not None:
+            prim = self.world.stage.GetPrimAtPath(prim_path)
+            if not prim.GetAttribute("xformOp:scale"):
+                UsdGeom.Xformable(prim).AddScaleOp()
+            prim.GetAttribute("xformOp:scale").Set(Gf.Vec3d(*[float(x) for x in scale]))
+
+    def __set_prim_display_color(self, prim, color) -> None:
+        if color is None:
+            return
+        rgba = list(color)
+        if len(rgba) == 3:
+            rgba.append(1.0)
+        try:
+            gprim = UsdGeom.Gprim(prim)
+            gprim.CreateDisplayColorAttr().Set([Gf.Vec3f(*[float(x) for x in rgba[:3]])])
+            gprim.CreateDisplayOpacityAttr().Set([float(rgba[3])])
+        except Exception:
+            pass
+
+    def __disable_prim_collisions(self, root_prim) -> None:
+        for prim in Usd.PrimRange(root_prim):
+            attr = prim.GetAttribute("physics:collisionEnabled")
+            if attr:
+                attr.Set(False)
+            if prim.HasAPI(UsdPhysics.CollisionAPI):
+                collision_api = UsdPhysics.CollisionAPI(prim)
+                enabled_attr = collision_api.GetCollisionEnabledAttr()
+                if enabled_attr:
+                    enabled_attr.Set(False)
+            rigid_enabled = prim.GetAttribute("physics:rigidBodyEnabled")
+            if rigid_enabled:
+                rigid_enabled.Set(False)
+
+    def __add_recording_mjcf_visual(self) -> None:
+        """Import the exact episode MJCF as a hash-isolated read-only USD."""
+        from simple.evals.task234_reproduction import mjcf_bundle_hash
+
+        visual_mjcf_path = getattr(
+            self.task, "isaac_mujoco_visual_mjcf_path", None
+        )
+        if visual_mjcf_path is None:
+            visual_mjcf_path = self.task.mujoco_full_scene_mjcf_path
+        mjcf_path = os.path.abspath(os.fspath(visual_mjcf_path))
+        bundle_hash = mjcf_bundle_hash(mjcf_path)
+        cache_root = os.environ.get(
+            "SIMPLE_ISAAC_MJCF_CACHE", "/tmp/simple_isaac_mjcf_cache"
+        )
+        cache_dir = os.path.join(cache_root, bundle_hash)
+        os.makedirs(cache_dir, exist_ok=True)
+        usd_path = os.path.join(cache_dir, "scene.usd")
+        root_path = "/World/Task3"
+
+        if os.path.isfile(usd_path):
+            isaacsim_stage.add_reference_to_stage(usd_path, root_path)
+        else:
+            status, import_config = omni.kit.commands.execute(
+                "MJCFCreateImportConfig"
+            )
+            if not status:
+                raise RuntimeError("Isaac MJCF importer is not enabled")
+            import_config.set_fix_base(False)
+            import_config.set_make_default_prim(False)
+            import_config.set_create_physics_scene(False)
+            import_config.set_import_inertia_tensor(True)
+            import_config.set_visualize_collision_geoms(False)
+            status, _ = omni.kit.commands.execute(
+                "MJCFCreateAsset",
+                mjcf_path=mjcf_path,
+                import_config=import_config,
+                prim_path=root_path,
+                dest_path=usd_path,
+            )
+            if not status or not os.path.isfile(usd_path):
+                raise RuntimeError(
+                    f"Failed to derive Isaac USD from recording MJCF: {mjcf_path}"
+                )
+            if not self.world.stage.GetPrimAtPath(root_path).IsValid():
+                isaacsim_stage.add_reference_to_stage(usd_path, root_path)
+
+        root_prim = self.world.stage.GetPrimAtPath(root_path)
+        if not root_prim.IsValid():
+            raise RuntimeError(f"Derived recording USD has no root {root_path}")
+        self.__disable_prim_collisions(root_prim)
+
+        frozen_camera_parent = self.task.isaac_policy_camera_parent_prim
+        if not self.world.stage.GetPrimAtPath(frozen_camera_parent).IsValid():
+            raise RuntimeError(
+                "Derived recording USD does not preserve the frozen torso path: "
+                f"{frozen_camera_parent}"
+            )
+
+        # Match imported Xforms back to MuJoCo bodies by authored body name.
+        prims_by_name: dict[str, list] = {}
+        for prim in Usd.PrimRange(root_prim):
+            prims_by_name.setdefault(prim.GetName(), []).append(prim)
+            if prim.GetName().lower() in {"floor", "ground", "groundplane"}:
+                visibility = prim.GetAttribute("visibility")
+                if visibility:
+                    visibility.Set("invisible")
+
+        model = self._recording_mujoco_model
+        root_joint_id = next(
+            joint_id
+            for joint_id in range(model.njnt)
+            if int(model.jnt_qposadr[joint_id]) == 0
+        )
+        robot_root_body = int(model.jnt_bodyid[root_joint_id])
+
+        def is_descendant(body_id: int, ancestor: int) -> bool:
+            current = body_id
+            while current > 0:
+                if current == ancestor:
+                    return True
+                current = int(model.body_parentid[current])
+            return False
+
+        self._recording_body_visuals = []
+        missing_bodies = []
+        for body_id in range(1, model.nbody):
+            body_name = str(model.body(body_id).name or "")
+            matches = prims_by_name.get(body_name, [])
+            if len(matches) != 1:
+                missing_bodies.append((body_name, len(matches)))
+                continue
+            self._recording_body_visuals.append(
+                (
+                    body_id,
+                    body_name,
+                    is_descendant(body_id, robot_root_body),
+                    XFormPrim(prim_path=str(matches[0].GetPath())),
+                )
+            )
+        if missing_bodies:
+            raise RuntimeError(
+                "Cannot map every MJCF body to exactly one derived USD prim: "
+                f"{missing_bodies[:12]}"
+            )
+        self._recording_mjcf_hash = bundle_hash
+        print(
+            f"[Task{self.task.isaac_reproduction_spec.task_number}Reproduction] "
+            f"derived_usd={usd_path} mjcf_bundle_sha256={bundle_hash}"
+        )
+
+    def __sync_recording_mjcf_visual(self, mujoco_env) -> None:
+        spec = self.task.isaac_reproduction_spec
+        translation = np.asarray(spec.task_translate, dtype=np.float64)
+        for body_id, body_name, is_robot, visual in self._recording_body_visuals:
+            position = np.asarray(mujoco_env.mjData.xpos[body_id], dtype=np.float64)
+            position = position + translation
+            if is_robot:
+                position[2] += spec.robot_visual_z_offset
+            elif spec.trash_visual_z_offset is not None:
+                lower_name = body_name.lower()
+                if "trash" in lower_name or "can" in lower_name:
+                    position[2] += spec.trash_visual_z_offset
+            orientation = np.asarray(
+                mujoco_env.mjData.xquat[body_id], dtype=np.float64
+            )
+            visual.set_world_pose(position=position, orientation=orientation)
+
+    def __task_visual_specs(self, attr_name: str) -> list[dict]:
+        specs = getattr(self.task, attr_name, [])
+        if callable(specs):
+            specs = specs()
+        return list(specs or [])
+
+    def __create_task_usd_visual(self, spec: dict) -> None:
+        name = str(spec["name"])
+        prim_path = spec.get("prim_path") or f"{self.workspace_prim_path}/{name}"
+        usd_path = self.__resolve_task_usd_path(spec["usd_path"])
+
+        if not self.world.stage.GetPrimAtPath(prim_path).IsValid():
+            isaacsim_stage.add_reference_to_stage(usd_path=usd_path, prim_path=prim_path)
+            prim = self.world.stage.GetPrimAtPath(prim_path)
+            if spec.get("disable_collision", True):
+                self.__disable_prim_collisions(prim)
+        self.task_visuals[name] = {
+            "prim_path": prim_path,
+            "sync_body": spec.get("sync_body"),
+            "sync_subprims": dict(spec.get("sync_subprims", {})),
+        }
+
+    def __create_task_primitive_visual(self, spec: dict) -> None:
+        name = str(spec["name"])
+        prim_path = spec.get("prim_path") or f"{self.workspace_prim_path}/{name}"
+        primitive_type = str(spec.get("type", "cube")).lower()
+
+        if not self.world.stage.GetPrimAtPath(prim_path).IsValid():
+            if primitive_type in {"dome_light", "domelight"}:
+                isaacsim_prims.create_prim(prim_path, "DomeLight")
+            elif primitive_type in {"sphere", "ball"}:
+                sphere.VisualSphere(
+                    prim_path=prim_path,
+                    position=np.asarray(spec.get("pos", [0.0, 0.0, 0.0]), dtype=np.float32),
+                    radius=float(spec.get("radius", 1.0)),
+                    color=np.asarray(spec.get("color", [1.0, 1.0, 1.0]), dtype=np.float32),
+                )
+            else:
+                omni.kit.commands.execute(
+                    "CreateMeshPrimWithDefaultXform",
+                    prim_type="Cube",
+                    prim_path=prim_path,
+                )
+                prim = self.world.stage.GetPrimAtPath(prim_path)
+                self.__set_prim_display_color(prim, spec.get("color"))
+            self.__apply_task_primitive_material(prim_path, spec)
+        self.__apply_task_primitive_attrs(prim_path, spec)
+
+        self.task_visuals[name] = {
+            "prim_path": prim_path,
+            "sync_body": spec.get("sync_body"),
+            "sync_subprims": dict(spec.get("sync_subprims", {})),
+        }
+
+    def __apply_task_primitive_material(self, prim_path: str, spec: dict) -> None:
+        textures_dir = spec.get("grass_textures_dir")
+        material_tool = spec.get("grass_material_tool")
+        if not textures_dir or not material_tool:
+            return
+
+        key = f"grass_material:{prim_path}"
+        try:
+            module_spec = importlib.util.spec_from_file_location(
+                "_simple_arena_grass_ground_material",
+                os.fspath(material_tool),
+            )
+            if module_spec is None or module_spec.loader is None:
+                raise ImportError(f"Cannot load {material_tool}")
+            module = importlib.util.module_from_spec(module_spec)
+            module_spec.loader.exec_module(module)
+            module.apply_grass_pbr_to_ground(
+                prim_path=prim_path,
+                textures_dir=os.fspath(textures_dir),
+                uv_scale=tuple(spec.get("uv_scale", (150.0, 150.0))),
+            )
+        except Exception as exc:
+            if key not in self._missing_task_visual_paths:
+                print(f"[IsaacTaskVisual] grass material skipped for {prim_path}: {exc}")
+                self._missing_task_visual_paths.add(key)
+
+    def __apply_task_primitive_attrs(self, prim_path: str, spec: dict) -> None:
+        primitive_type = str(spec.get("type", "cube")).lower()
+        if primitive_type not in {"dome_light", "domelight"}:
+            return
+
+        prim = self.world.stage.GetPrimAtPath(prim_path)
+        if spec.get("intensity") is not None and prim.GetAttribute("inputs:intensity"):
+            prim.GetAttribute("inputs:intensity").Set(float(spec["intensity"]))
+        if spec.get("color") is not None and prim.GetAttribute("inputs:color"):
+            prim.GetAttribute("inputs:color").Set(
+                Gf.Vec3f(*[float(x) for x in spec["color"][:3]])
+            )
+
+    def __update_task_visual_spec(self, spec: dict, visual_type: str) -> None:
+        name = str(spec["name"])
+        if name not in self.task_visuals:
+            if visual_type == "usd":
+                try:
+                    self.__create_task_usd_visual(spec)
+                except FileNotFoundError as exc:
+                    required = bool(spec.get("required", False))
+                    key = os.fspath(spec.get("usd_path", exc.filename))
+                    if key not in self._missing_task_visual_paths:
+                        print(f"[IsaacTaskVisual] missing USD, skipped: {key}")
+                        self._missing_task_visual_paths.add(key)
+                    if required:
+                        raise
+                    return
+            else:
+                self.__create_task_primitive_visual(spec)
+
+        visual = self.task_visuals[name]
+        self.__set_prim_pose_scale(
+            visual["prim_path"],
+            spec.get("pos", [0.0, 0.0, 0.0]),
+            spec.get("quat", [1.0, 0.0, 0.0, 0.0]),
+            spec.get("scale"),
+            bool(spec.get("visible", True)),
+        )
+        self.__apply_task_primitive_attrs(visual["prim_path"], spec)
+
+    def __update_task_visuals(self) -> None:
+        if not hasattr(self, "task_visuals"):
+            return
+
+        for visual in self.task_visuals.values():
+            XFormPrim(prim_path=visual["prim_path"]).set_visibility(False)
+
+        for spec in self.__task_visual_specs("isaac_extra_usd_references"):
+            self.__update_task_visual_spec(spec, "usd")
+        for spec in self.__task_visual_specs("isaac_extra_primitives"):
+            self.__update_task_visual_spec(spec, "primitive")
+
+    def __sync_task_visuals(self, synced_pose_by_name: dict[str, tuple]) -> None:
+        for visual in getattr(self, "task_visuals", {}).values():
+            sync_body = visual.get("sync_body")
+            if sync_body in synced_pose_by_name:
+                obj_pos, obj_ori = synced_pose_by_name[sync_body]
+                XFormPrim(prim_path=visual["prim_path"]).set_local_pose(
+                    translation=obj_pos,
+                    orientation=obj_ori,
+                )
+            for relative_path, body_name in visual.get("sync_subprims", {}).items():
+                if body_name not in synced_pose_by_name:
+                    continue
+                obj_pos, obj_ori = synced_pose_by_name[body_name]
+                subprim_path = f"{visual['prim_path'].rstrip('/')}/{relative_path.lstrip('/')}"
+                prim = self.world.stage.GetPrimAtPath(subprim_path)
+                if not prim.IsValid():
+                    key = f"sync_subprim:{subprim_path}"
+                    if key not in self._missing_task_visual_paths:
+                        print(f"[IsaacTaskVisual] missing sync subprim: {subprim_path}")
+                        self._missing_task_visual_paths.add(key)
+                    continue
+                XFormPrim(prim_path=subprim_path).set_world_pose(
+                    position=obj_pos,
+                    orientation=obj_ori,
+                )
 
     def __reset_objects(self):
         # from omni.isaac.core.utils.prims import delete_prim
@@ -577,6 +998,9 @@ class IsaacSimSimulator(Simulator):
                 shader.CreateInput(key, Sdf.ValueTypeNames.Float).Set(obj_info.material[key]) # type:ignore object_shader_param[key]
 
     def step(self, mujoco_env = None):
+        read_only_mirror = bool(
+            self.task.metadata.get("isaac_read_only_mirror", False)
+        )
         if not self.is_isaac_reset:
             self.world.reset()
             # self.__update_object()
@@ -665,9 +1089,16 @@ class IsaacSimSimulator(Simulator):
         if mujoco_env is not None:
             self.sync_states(mujoco_env)
 
-        self.world.step(render=False)
+        # Strict reproduction never advances a second physics clock.  USD
+        # transforms are authored directly from MuJoCo, then Replicator is
+        # asked to render while the Isaac timeline remains paused.
+        if not read_only_mirror:
+            self.world.step(render=False)
         self.update_visuals()
-        rep.orchestrator.step(rt_subframes=1, pause_timeline=False)
+        rep.orchestrator.step(
+            rt_subframes=1,
+            pause_timeline=read_only_mirror,
+        )
         self._update_collision_spheres()
         self.step_id += 1
 
@@ -730,11 +1161,19 @@ class IsaacSimSimulator(Simulator):
             step_id, joint_state, obj_names, obj_positions, obj_orientations, robot_position, articulated_joints_state, articulate_object_position = states[:]
         else:
             step_id, joint_state, obj_names, obj_positions, obj_orientations, robot_position = states[:]
+
+        if getattr(self.task, "isaac_reproduction_spec", None) is not None:
+            self.__sync_recording_mjcf_visual(mujoco_env)
         
+        synced_pose_by_name = {}
         for obj_name, obj_pos, obj_ori in zip(obj_names, obj_positions, obj_orientations):
-            obj = self.objects[obj_name]
+            synced_pose_by_name[obj_name] = (obj_pos, obj_ori)
+            obj = self.objects.get(obj_name)
+            if obj is None:
+                continue
             obj_xfrom = XFormPrim(prim_path=obj["object_prim_path"])
             obj_xfrom.set_local_pose(translation=obj_pos, orientation=obj_ori) # obj["xform"]
+        self.__sync_task_visuals(synced_pose_by_name)
         
         joint_indices = []
         qpos = []
@@ -756,7 +1195,16 @@ class IsaacSimSimulator(Simulator):
                 articulated_object.set_joint_positions(articulate_joint_pos, joint_indices=articulate_joint_indices)
 
         if self.need_gravity:
-            self.robot.set_world_pose(position=robot_position[:3], orientation=robot_position[3:])
+            robot_visual_pose = np.asarray(robot_position, dtype=np.float64).copy()
+            reproduction_spec = getattr(self.task, "isaac_reproduction_spec", None)
+            if reproduction_spec is not None:
+                robot_visual_pose[:3] += np.asarray(
+                    reproduction_spec.task_translate, dtype=np.float64
+                )
+                robot_visual_pose[2] += reproduction_spec.robot_visual_z_offset
+            self.robot.set_world_pose(
+                position=robot_visual_pose[:3], orientation=robot_visual_pose[3:]
+            )
             if self.articulated_objects:
                 for articulated_object in self.articulated_objects.values():
                     articulated_object.set_world_pose(position=articulate_object_position[:3], orientation=articulate_object_position[3:])
@@ -771,6 +1219,8 @@ class IsaacSimSimulator(Simulator):
                 num_dofs = articulated_object._articulation_view.num_dof
                 zero = np.zeros(num_dofs, dtype=np.float32)
                 articulated_object._articulation_view.set_joint_velocities(zero)
+        self._mirrored_mujoco_sim_time = float(mujoco_env.mjData.time)
+        self._mirrored_frame_id = int(step_id)
         return step_id
 
     def get_states(self) -> Dict[str, float]:
@@ -874,7 +1324,13 @@ class IsaacSimSimulator(Simulator):
                 cam_prim_path = f"{self.workspace_prim_path}/Robot/{self.task.robot.robot_ns}"
             elif cam_info.mount == "eye_in_head":
                 head_prim_link = self.task.robot.head_cam_link
-                cam_prim_path = f"{self.workspace_prim_path}/Robot/{self.task.robot.robot_ns}/{head_prim_link}"
+                frozen_parent = getattr(
+                    self.task, "isaac_policy_camera_parent_prim", None
+                )
+                if frozen_parent:
+                    cam_prim_path = frozen_parent
+                else:
+                    cam_prim_path = f"{self.workspace_prim_path}/Robot/{self.task.robot.robot_ns}/{head_prim_link}"
             else:
                 raise ValueError(f"Unsupported camera mount: {cam_info.mount}")
 
@@ -942,6 +1398,28 @@ class IsaacSimSimulator(Simulator):
             frame = camera.get_rgba()
             raw_rgb = frame[...,:3].astype(np.uint8)
             render_products[cam_name] = raw_rgb
+        reproduction_spec = getattr(self.task, "isaac_reproduction_spec", None)
+        if reproduction_spec is not None:
+            from simple.evals.task234_reproduction import validate_policy_rgb
+
+            policy_camera = getattr(self.task, "isaac_policy_camera_name")
+            if set(render_products) != {policy_camera}:
+                raise RuntimeError(
+                    "Strict eval requires exactly one Isaac policy render product "
+                    f"named {policy_camera!r}; got {sorted(render_products)}"
+                )
+            frame_id = getattr(self, "_mirrored_frame_id", None)
+            sim_time = getattr(self, "_mirrored_mujoco_sim_time", None)
+            if frame_id is None or sim_time is None:
+                raise RuntimeError("Isaac rendered before receiving a MuJoCo state")
+            validate_policy_rgb(
+                render_products[policy_camera],
+                image_sim_time=sim_time,
+                mujoco_sim_time=sim_time,
+                frame_id=frame_id,
+                previous_frame_id=getattr(self, "_last_policy_frame_id", None),
+            )
+            self._last_policy_frame_id = frame_id
         return render_products
     
     def calc_surface_center(self, surface_prim):

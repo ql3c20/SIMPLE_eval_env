@@ -31,6 +31,7 @@ import mujoco
 
 from PIL import Image
 import os
+from pathlib import Path
 import cv2
 import transforms3d as t3d
 
@@ -76,6 +77,9 @@ class MujocoSimulator(Simulator):
         self._setup_scene(**kwargs)
 
     def step(self, render=True, render_robot_mask=False, **kwargs) -> Dict[str, np.ndarray] | None:
+        before_step = getattr(self.task, "before_mujoco_step", None)
+        if before_step is not None:
+            before_step(self)
         if self.need_gravity:
             if self.task.robot.command is None:# probably resetting?
                 mujoco.mj_step(self.mjModel, self.mjData, nstep=1)
@@ -87,6 +91,10 @@ class MujocoSimulator(Simulator):
             num_physics_steps = int(((self.render_step + 1) / self.render_hz - current_physics_time) // timestep)
             assert num_physics_steps > 0 and num_physics_steps < 100000, "warning: why so many physics steps?"
             mujoco.mj_step(self.mjModel, self.mjData, nstep=num_physics_steps)
+
+        after_step = getattr(self.task, "after_mujoco_step", None)
+        if after_step is not None:
+            after_step(self)
 
         self.render_step += 1
         if self.viewer is not None:
@@ -142,6 +150,11 @@ class MujocoSimulator(Simulator):
 
 
     def _setup_scene(self, **kwargs):
+        full_scene_path = getattr(self.task, "mujoco_full_scene_mjcf_path", None)
+        if full_scene_path is not None:
+            self._setup_recording_scene(full_scene_path)
+            return
+
         from simple.core.actor import RobotActor, ObjectActor, ArticulatedObjectActor, CameraEntity
         from simple.assets.primitive import Primitive
 
@@ -240,11 +253,55 @@ class MujocoSimulator(Simulator):
             "mujoco_ground_friction",
             [1.0, 0.005, 0.0001],
         )  # [sliding, torsional, rolling]
+        ground_solref = getattr(self.task, "mujoco_ground_solref", None)
+        if ground_solref is not None:
+            ground.solref = ground_solref
+        print(
+            "[MujocoGround] friction="
+            f"{list(ground.friction)} solref={list(ground.solref)}"
+        )
 
         # 5. disable gravity (for better PID control of arms)
         self.mjModel=mjSpec.compile()
         self.mjData=mujoco.MjData(self.mjModel)
         self.mjSpec=mjSpec
+
+        reproduction_spec = getattr(self.task, "isaac_reproduction_spec", None)
+        if reproduction_spec is not None:
+            from simple.evals.task234_reproduction import (
+                validate_model_dimensions,
+                validate_task_joint_layout,
+            )
+
+            validate_model_dimensions(self.mjModel, reproduction_spec)
+            self.task.mujoco_task_qpos_addresses = validate_task_joint_layout(
+                self.mjModel, reproduction_spec
+            )
+            self.task.isaac_mujoco_model = self.mjModel
+            export_dir = (
+                Path(os.environ.get(
+                    "SIMPLE_INFERENCE_MJCF_CACHE",
+                    "/tmp/simple_task234_inference_mjcf",
+                ))
+                / str(os.getpid())
+                / self.task.uid
+            )
+            export_dir.mkdir(parents=True, exist_ok=True)
+            export_path = export_dir / "scene.xml"
+            mujoco.mj_saveLastXML(os.fspath(export_path), self.mjModel)
+            # This file exists only so Isaac can derive a read-only visual USD.
+            # Keep it separate from ``mujoco_full_scene_mjcf_path``: the latter
+            # selects the legacy recording-snapshot physics path on reset.
+            self.task.isaac_mujoco_visual_mjcf_path = export_path
+
+        for site_name in getattr(self.task, "mujoco_hidden_sites", ()):
+            site_id = mujoco.mj_name2id(
+                self.mjModel,
+                mujoco.mjtObj.mjOBJ_SITE,
+                site_name,
+            )
+            if site_id >= 0:
+                self.mjModel.site_rgba[site_id, 3] = 0.0
 
         if not self.need_gravity:
             self.mjModel.opt.gravity= (0,0,0) # type: ignore
@@ -349,6 +406,112 @@ class MujocoSimulator(Simulator):
             
         # ?. reset render step
         self.render_step = 0
+
+    def _setup_recording_scene(self, scene_path) -> None:
+        """Load an episode's complete MJCF snapshot without rebuilding its scene.
+
+        The snapshot already contains the robot, task assets, floor, contacts and
+        actuators.  Attaching SIMPLE's generic robot or task fragments here would
+        silently change dynamics and qpos ordering, so this path is intentionally
+        separate from ``_setup_scene``.
+        """
+        from simple.evals.task234_reproduction import (
+            validate_model_dimensions,
+            validate_task_joint_layout,
+        )
+
+        scene_path = os.fspath(scene_path)
+        if not os.path.isfile(scene_path):
+            raise FileNotFoundError(f"Recording MJCF snapshot does not exist: {scene_path}")
+
+        mjSpec = mujoco.MjSpec.from_file(scene_path)
+        self.mjSpec = mjSpec
+        self.mj_worldbody = mjSpec.worldbody
+        self.robot_mjcf = mjSpec
+        self.articulated_object_joints = None
+        self.mjModel = mjSpec.compile()
+        self.mjData = mujoco.MjData(self.mjModel)
+
+        spec = getattr(self.task, "isaac_reproduction_spec", None)
+        if spec is None:
+            raise ValueError("A full recording scene requires isaac_reproduction_spec")
+        validate_model_dimensions(self.mjModel, spec)
+        # Isaac consumes this only as a name/address description for its
+        # read-only visual mirror; MuJoCo remains the sole physics owner.
+        self.task.isaac_mujoco_model = self.mjModel
+        self.task.mujoco_task_qpos_addresses = validate_task_joint_layout(
+            self.mjModel, spec
+        )
+
+        initial_qpos = np.asarray(
+            getattr(self.task, "mujoco_initial_full_qpos"), dtype=np.float64
+        ).reshape(-1)
+        initial_qvel = np.asarray(
+            getattr(self.task, "mujoco_initial_full_qvel"), dtype=np.float64
+        ).reshape(-1)
+        if initial_qpos.shape != (self.mjModel.nq,):
+            raise ValueError(
+                f"Recording initial qpos shape {initial_qpos.shape} does not match "
+                f"MJCF nq={self.mjModel.nq}"
+            )
+        if initial_qvel.shape != (self.mjModel.nv,):
+            raise ValueError(
+                f"Recording initial qvel shape {initial_qvel.shape} does not match "
+                f"MJCF nv={self.mjModel.nv}"
+            )
+        self.mjData.qpos[:] = initial_qpos
+        self.mjData.qvel[:] = initial_qvel
+
+        assert isinstance(self.task.robot, Controllable), "Task robot is not controllable"
+        self.joints, self.actuators = self.task.robot.setup_control(
+            self.mjData, self.mjModel, mjSpec=self.mjSpec
+        )
+
+        # The strict reproduction task reads task state from qpos addresses, not
+        # guessed body names.  Keep object info empty unless a task explicitly
+        # supplies verified snapshot body names.
+        self.mj_objects = {}
+        self.obj_names = []
+        for role, body_name in getattr(
+            self.task, "mujoco_recording_object_body_names", {}
+        ).items():
+            body_id = mujoco.mj_name2id(
+                self.mjModel, mujoco.mjtObj.mjOBJ_BODY, body_name
+            )
+            if body_id < 0:
+                raise ValueError(
+                    f"Recording MJCF has no required {role!r} body {body_name!r}"
+                )
+            self.mj_objects[role] = self.mjData.body(body_name)
+            self.obj_names.append(body_name)
+
+        mujoco.mj_forward(self.mjModel, self.mjData)
+        self.render_option = mujoco.MjvOption()  # type: ignore
+        mujoco.mjv_defaultOption(self.render_option)  # type: ignore
+        if hasattr(self, "renderers") and self.renderers:
+            self.close()
+        self.renderers = {}
+        camera_resolution = (640, 480)
+        if self.task.layout.cameras:
+            first_camera = next(iter(self.task.layout.cameras.values()))
+            camera_resolution = first_camera.resolution
+        for camera_id in range(self.mjModel.ncam):
+            camera_name = mujoco.mj_id2name(
+                self.mjModel, mujoco.mjtObj.mjOBJ_CAMERA, camera_id
+            )
+            if camera_name:
+                self.renderers[camera_name] = mujoco.Renderer(
+                    self.mjModel,
+                    height=int(camera_resolution[1]),
+                    width=int(camera_resolution[0]),
+                )
+        self.render_step = 0
+        print(
+            f"[Task{spec.task_number}Reproduction] recording="
+            f"{self.task.mujoco_reproduction_recording} "
+            f"nq/nv/nu={self.mjModel.nq}/{self.mjModel.nv}/{self.mjModel.nu} "
+            f"mjcf={scene_path}"
+        )
 
     def _build_object(self, mjSpec, mjWorld, actor: ObjectActor):
         # asset_id = actor.asset.uid
@@ -507,6 +670,43 @@ class MujocoSimulator(Simulator):
                     material.reflectance = float(
                         ground_visual.get("reflectance", 0.0)
                     )
+
+        foot_friction = getattr(self.task, "mujoco_foot_friction", None)
+        foot_solref = getattr(self.task, "mujoco_foot_solref", None)
+        if foot_friction is not None or foot_solref is not None:
+            foot_body_names = set(
+                getattr(self.task, "mujoco_foot_body_names", ())
+            )
+            foot_collision_geoms = []
+            for geom in robot_mjcf.geoms:
+                parent_name = getattr(getattr(geom, "parent", None), "name", "")
+                if (
+                    parent_name in foot_body_names
+                    and (int(geom.contype) != 0 or int(geom.conaffinity) != 0)
+                ):
+                    if foot_friction is not None:
+                        geom.friction = foot_friction
+                    if foot_solref is not None:
+                        geom.solref = foot_solref
+                    foot_collision_geoms.append(geom)
+            expected = int(
+                getattr(
+                    self.task,
+                    "mujoco_expected_foot_collision_geoms",
+                    len(foot_collision_geoms),
+                )
+            )
+            if len(foot_collision_geoms) != expected:
+                raise RuntimeError(
+                    "Foot friction override matched "
+                    f"{len(foot_collision_geoms)} collision geoms, expected {expected}"
+                )
+            print(
+                "[MujocoFeet] collision_geoms="
+                f"{len(foot_collision_geoms)} "
+                f"friction={list(foot_collision_geoms[0].friction)} "
+                f"solref={list(foot_collision_geoms[0].solref)}"
+            )
         # except FileNotFoundError:
         #     # 2. catch file not found error if files are not auto-downloaded
         #     from huggingface_hub import snapshot_download

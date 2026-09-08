@@ -8,6 +8,7 @@ Licensed under the terms in LICENSE file.
 import os
 import cv2
 import shutil
+import subprocess
 import numpy as np
 from PIL import Image
 
@@ -58,15 +59,24 @@ class VideoWriter:
             cv2.imwrite(f"{self.filename}_{self.frame_idx:03d}.png", image)
         self.frame_idx += 1
 
-    def release(self, success = True):
+    def release(self, success=True, output_filename: str | None = None) -> str:
         self.video_writer.release()
         suffix = "success" if success else "failed"
 
-        newfilename = f"{self.filename[:-4]}_{suffix}.mp4"
+        newfilename = output_filename or f"{self.filename[:-4]}_{suffix}.mp4"
+        os.makedirs(os.path.dirname(newfilename), exist_ok=True)
         if os.path.exists(newfilename):
             print(f"remove existing file: {newfilename}")
             os.remove(newfilename)
 
         if self.is_ffmpeg_installed:
-            os.system(f"ffmpeg -i {self.filename} -vcodec libx264 {newfilename} > /dev/null 2>&1")
-            os.system(f"rm {self.filename}") 
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", self.filename, "-vcodec", "libx264", newfilename],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            os.remove(self.filename)
+        else:
+            shutil.move(self.filename, newfilename)
+        return newfilename

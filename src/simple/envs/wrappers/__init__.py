@@ -6,6 +6,13 @@ Licensed under the terms in LICENSE file.
 """
 
 from .policy_debugger import PolicyDebugger
-from .video_recorder import VideoRecorder
+from .video_recorder import VideoRecorder, task_video_recorder_options
 from .episode_extractor import EpisodeExtractor
-from .data_recoder import DataRecorder
+
+try:
+    from .data_recoder import DataRecorder
+except ModuleNotFoundError as exc:
+    if exc.name != "envlogger":
+        raise
+    # Dataset recording is optional for policy evaluation/video capture.
+    DataRecorder = None

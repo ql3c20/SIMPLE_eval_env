@@ -102,6 +102,17 @@ from .g1_wholebody_handover_teleop import G1WholebodyHandoverTeleop
 from .g1_wholebody_pick_and_place_and_hug_container_teleop import G1WholebodyPickAndPlaceAndHugContainerTaskTeleop
 from .g1_wholebody_xmove_pick_teleop import G1WholebodyXMovePickTaskTeleop
 from .g1_fullstate_20260615_task1 import G1Fullstate20260615Task1
+from .g1_fullstate_20260625_task2 import G1Fullstate20260625Task2
+from .g1_fullstate_20260612_task3 import G1Fullstate20260612Task3
+from .g1_fullstate_20260729_task4 import G1Fullstate20260729Task4
+from .g1_fullstate_task234_isaac_eval import (
+    G1Fullstate20260805Task2IsaacEval,
+    G1Fullstate20260804Task3IsaacEval,
+    G1Fullstate20260729Task4IsaacEval,
+)
+from .g1_fullstate_arena_football import G1FullstateArenaFootball
+from .g1_fullstate_arena_pp_box import G1FullstateArenaPPBox
+from .g1_fullstate_arena_open_door import G1FullstateArenaOpenDoor
 from .g1_wholebody_close_door_teleop import G1WholebodyCloseDoorTaskTeleop
 from .g1_wholebody_open_oven_teleop import G1WholebodyOpenOvenTaskTeleop
 from .g1_wholebody_open_faucet_teleop import G1WholebodyOpenFaucetTaskTeleop

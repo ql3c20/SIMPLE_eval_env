@@ -294,15 +294,18 @@ class EnvRunner:
         task_id = f"episode_{episode_idx}"
         env = self._raw_env
         if self.config.save_video:
-            from simple.envs.wrappers.video_recorder import VideoRecorder
+            from simple.envs.wrappers.video_recorder import (
+                VideoRecorder,
+                task_video_recorder_options,
+            )
 
             output_dir = eval_output_dir or (Path(self.config.eval_dir) / self.policy_output_name(policy_name) / self.config.split)
             env = VideoRecorder(
                 env=self._raw_env,
                 video_folder=str(output_dir),
-                name_prefix=task_id,
                 framerate=self._render_hz,
                 write_png=False,
+                **task_video_recorder_options(self.task, episode_idx),
             )
 
         observation, info = env.reset(options={"state_dict": env_conf})
