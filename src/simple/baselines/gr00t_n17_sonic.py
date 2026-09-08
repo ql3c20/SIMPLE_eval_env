@@ -99,6 +99,7 @@ class Gr00tN17SonicAgent(PrimitiveAgent):
         self.body_qvel_adrs = None
         self.debug_dir = os.environ.get("GR00T_SONIC_DEBUG_DIR")
         self._debug_query_count = 0
+        self._server_reset_pending = True
 
     def _ensure_mujoco_indices(self) -> None:
         if self.body_qpos_adrs is not None:
@@ -199,9 +200,30 @@ class Gr00tN17SonicAgent(PrimitiveAgent):
         ).astype(np.float32)
 
     @staticmethod
+    def _policy_image(observation) -> np.ndarray:
+        """Use the Arena-aligned mono camera while preserving legacy tasks."""
+        if "front_camera" in observation:
+            return observation["front_camera"]
+        return observation["head_stereo_left"]
+
+    @staticmethod
     def _hand_to_mujoco(hand: np.ndarray) -> np.ndarray:
         # GR00T action: thumb,index,middle -> MuJoCo: thumb,middle,index.
         return np.asarray(hand, dtype=np.float32)[[0, 1, 2, 5, 6, 3, 4]]
+
+    @staticmethod
+    def _save_debug_image(path: Path, image: np.ndarray) -> None:
+        """Keep optional diagnostics from aborting an evaluation.
+
+        Isaac Sim can prepend a bundled Pillow plugin whose JPEG encoder ABI
+        does not match the Pillow package in SIMPLE's virtual environment.
+        PNG is already used successfully by this process, and a debug write
+        failure must not terminate policy execution.
+        """
+        try:
+            Image.fromarray(np.asarray(image, dtype=np.uint8)).save(path, format="PNG")
+        except Exception as exc:
+            print(f"[GR00T-N1.7/SONIC] warning: failed to save {path}: {exc!r}")
 
     def _decode(
         self, action78: np.ndarray, transition_alpha: float | None = None
@@ -285,12 +307,14 @@ class Gr00tN17SonicAgent(PrimitiveAgent):
             return self._decode(initial_action, transition_alpha=alpha)
         if not self._pending:
             sonic_state = self._sonic_state46(observation)
+            policy_image = self._policy_image(observation)
             if self.debug_dir and self._debug_query_count == 0:
                 debug_dir = Path(self.debug_dir)
                 debug_dir.mkdir(parents=True, exist_ok=True)
-                Image.fromarray(
-                    np.asarray(observation["head_stereo_left"], dtype=np.uint8)
-                ).save(debug_dir / "first_policy_image.png")
+                self._save_debug_image(
+                    debug_dir / "first_policy_image.png",
+                    policy_image,
+                )
                 np.savez(
                     debug_dir / "first_policy_input.npz",
                     sonic_state=sonic_state,
@@ -300,13 +324,14 @@ class Gr00tN17SonicAgent(PrimitiveAgent):
                     ),
                 )
             action, *_ = self.client.query_action(
-                {"ego_view": observation["head_stereo_left"]},
+                {"ego_view": policy_image},
                 instruction or "move forward to pick up the cylinder",
                 {"sonic_state": sonic_state},
                 {},
-                history={},
+                history={"reset": True} if self._server_reset_pending else {},
                 dataset="unitree_g1_sonic",
             )
+            self._server_reset_pending = False
             action = np.asarray(action, dtype=np.float32)
             if action.ndim != 2 or action.shape[1] != 78:
                 raise ValueError(f"Expected GR00T action (T,78), got {action.shape}")
@@ -328,12 +353,10 @@ class Gr00tN17SonicAgent(PrimitiveAgent):
                 )
                 if self._debug_query_count == 0:
                     np.save(debug_dir / "first_predicted_action78.npy", action)
-                Image.fromarray(
-                    np.asarray(observation["head_stereo_left"], dtype=np.uint8)
-                ).save(
+                self._save_debug_image(
                     debug_dir
-                    / f"policy_image_query_{self._debug_query_count:04d}.jpg",
-                    quality=90,
+                    / f"policy_image_query_{self._debug_query_count:04d}.png",
+                    policy_image,
                 )
             left = action[:, 64:71]
             right = action[:, 71:78]
@@ -362,3 +385,4 @@ class Gr00tN17SonicAgent(PrimitiveAgent):
         self._stabilizer._cached_right_hand_q = None
         self._last_pred_action = None
         self._debug_query_count = 0
+        self._server_reset_pending = True

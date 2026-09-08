@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mujoco model="arena_pp_box_cardboard_box">
+  <compiler angle="radian" autolimits="true"/>
+  <asset>
+    <material name="cardboard" rgba="0.76 0.58 0.32 1" specular="0.04" shininess="0.08"/>
+  </asset>
+  <worldbody>
+    <body name="object">
+      <geom name="box_collision" type="box" size="0.105 0.105 0.105"
+            mass="0.05" material="cardboard"
+            group="1" contype="1" conaffinity="1" condim="4"
+            friction="1.0 0.05 0.01" solref="0.004 1.0" solimp="0.95 0.99 0.001"/>
+    </body>
+  </worldbody>
+</mujoco>

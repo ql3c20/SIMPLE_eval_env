@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mujoco model="arena_pp_box_table">
+  <compiler angle="radian" autolimits="true"/>
+  <asset>
+    <material name="table_top" rgba="0.72 0.72 0.70 1" specular="0.12" shininess="0.18"/>
+    <material name="table_frame" rgba="0.08 0.08 0.08 1" specular="0.20" shininess="0.25"/>
+  </asset>
+  <worldbody>
+    <!--
+      The demonstrations initialize the 0.21 m box at z=0.75, so its
+      bottom is exactly z=0.645.  The tabletop spans the complete recorded
+      twist2 box-initialization range without extending under the robot.
+    -->
+    <body name="table">
+      <geom name="top_collision" type="box" pos="-0.48 -4.775 0.61"
+            size="0.55 1.15 0.035" material="table_top"
+            group="1" contype="1" conaffinity="1" condim="4"
+            friction="1.0 0.05 0.01" solref="0.004 1.0" solimp="0.95 0.99 0.001"/>
+      <geom name="leg_xneg_yneg" type="box" pos="-0.93 -5.80 0.30"
+            size="0.035 0.035 0.30" material="table_frame"
+            group="1" contype="1" conaffinity="1"/>
+      <geom name="leg_xneg_ypos" type="box" pos="-0.93 -3.75 0.30"
+            size="0.035 0.035 0.30" material="table_frame"
+            group="1" contype="1" conaffinity="1"/>
+      <geom name="leg_xpos_yneg" type="box" pos="-0.03 -5.80 0.30"
+            size="0.035 0.035 0.30" material="table_frame"
+            group="1" contype="1" conaffinity="1"/>
+      <geom name="leg_xpos_ypos" type="box" pos="-0.03 -3.75 0.30"
+            size="0.035 0.035 0.30" material="table_frame"
+            group="1" contype="1" conaffinity="1"/>
+    </body>
+  </worldbody>
+</mujoco>

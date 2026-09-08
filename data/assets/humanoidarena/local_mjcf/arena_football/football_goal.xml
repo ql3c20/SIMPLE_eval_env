@@ -1,0 +1,27 @@
+<mujoco model="arena_football_goal">
+  <asset>
+    <material name="goal_white" rgba="0.92 0.92 0.88 1" />
+    <material name="goal_net" rgba="0.72 0.78 0.84 0.30" />
+    <material name="goal_line" rgba="0.96 0.96 0.96 1" />
+  </asset>
+
+  <worldbody>
+    <body name="goal">
+      <geom name="reference_line" type="box" pos="2.55 0.000 0.006" size="2.55 0.030 0.006" material="goal_line" contype="0" conaffinity="0" />
+
+      <geom name="left_post" type="capsule" fromto="0.000 0.000 0.000 0.000 0.000 1.850" size="0.045" material="goal_white" />
+      <geom name="right_post" type="capsule" fromto="5.100 0.000 0.000 5.100 0.000 1.850" size="0.045" material="goal_white" />
+      <geom name="crossbar" type="capsule" fromto="0.000 0.000 1.850 5.100 0.000 1.850" size="0.045" material="goal_white" />
+
+      <geom name="left_back_post" type="capsule" fromto="0.000 0.650 0.000 0.000 0.650 1.600" size="0.032" material="goal_white" />
+      <geom name="right_back_post" type="capsule" fromto="5.100 0.650 0.000 5.100 0.650 1.600" size="0.032" material="goal_white" />
+      <geom name="back_bar" type="capsule" fromto="0.000 0.650 1.600 5.100 0.650 1.600" size="0.032" material="goal_white" />
+      <geom name="left_depth_bar" type="capsule" fromto="0.000 0.000 1.850 0.000 0.650 1.600" size="0.032" material="goal_white" />
+      <geom name="right_depth_bar" type="capsule" fromto="5.100 0.000 1.850 5.100 0.650 1.600" size="0.032" material="goal_white" />
+
+      <geom name="net_back" type="box" pos="2.550 0.660 0.800" size="2.550 0.010 0.800" material="goal_net" contype="0" conaffinity="0" />
+      <geom name="net_left" type="box" pos="0.000 0.325 0.800" size="0.010 0.325 0.800" material="goal_net" contype="0" conaffinity="0" />
+      <geom name="net_right" type="box" pos="5.100 0.325 0.800" size="0.010 0.325 0.800" material="goal_net" contype="0" conaffinity="0" />
+    </body>
+  </worldbody>
+</mujoco>

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mujoco model="arena_pp_box_shelf">
+  <compiler angle="radian" autolimits="true"/>
+  <asset>
+    <material name="shelf_blue" rgba="0.03 0.22 0.55 1" specular="0.25" shininess="0.30"/>
+    <material name="shelf_dark" rgba="0.05 0.06 0.07 1" specular="0.18" shininess="0.20"/>
+  </asset>
+  <worldbody>
+    <body name="shelf">
+      <!-- Support heights match HumanoidArena's live-USD reward geometry. -->
+      <geom name="base_support_collision" type="box" pos="0 0 0.0965"
+            size="0.45 0.18 0.0125" material="shelf_dark"
+            group="1" contype="1" conaffinity="1" condim="4"
+            friction="1.0 0.05 0.01" solref="0.004 1.0" solimp="0.95 0.99 0.001"/>
+      <geom name="active_support_collision" type="box" pos="0 0 0.6352"
+            size="0.45 0.18 0.0125" material="shelf_dark"
+            group="1" contype="1" conaffinity="1" condim="4"
+            friction="1.0 0.05 0.01" solref="0.004 1.0" solimp="0.95 0.99 0.001"/>
+      <geom name="upper_support_collision" type="box" pos="0 0 1.1739"
+            size="0.45 0.18 0.0125" material="shelf_dark"
+            group="1" contype="1" conaffinity="1" condim="4"
+            friction="1.0 0.05 0.01" solref="0.004 1.0" solimp="0.95 0.99 0.001"/>
+
+      <geom name="post_xneg_yneg" type="box" pos="-0.425 -0.155 0.64"
+            size="0.025 0.025 0.64" material="shelf_blue"
+            group="1" contype="1" conaffinity="1"/>
+      <geom name="post_xneg_ypos" type="box" pos="-0.425 0.155 0.64"
+            size="0.025 0.025 0.64" material="shelf_blue"
+            group="1" contype="1" conaffinity="1"/>
+      <geom name="post_xpos_yneg" type="box" pos="0.425 -0.155 0.64"
+            size="0.025 0.025 0.64" material="shelf_blue"
+            group="1" contype="1" conaffinity="1"/>
+      <geom name="post_xpos_ypos" type="box" pos="0.425 0.155 0.64"
+            size="0.025 0.025 0.64" material="shelf_blue"
+            group="1" contype="1" conaffinity="1"/>
+    </body>
+  </worldbody>
+</mujoco>

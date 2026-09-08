@@ -49,6 +49,15 @@ Thumbs.db
 # data settings
 # -----------------------
 data/*
+!data/assets/
+data/assets/*
+!data/assets/humanoidarena/
+data/assets/humanoidarena/*
+!data/assets/humanoidarena/local_mjcf/
+data/assets/humanoidarena/local_mjcf/*
+!data/assets/humanoidarena/local_mjcf/arena_open_door/
+!data/assets/humanoidarena/local_mjcf/arena_football
+!data/assets/humanoidarena/local_mjcf/arena_pp_box
 !data/README.md
 !data/_download.py
 !.env.sample
@@ -99,3 +108,7 @@ MUJOCO_LOG.TXT
 
 # Local Hugging Face cache
 huggingface/
+debug/
+.evals/
+evals/
+outputs/
