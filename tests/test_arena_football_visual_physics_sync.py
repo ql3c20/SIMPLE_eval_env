@@ -10,11 +10,29 @@ import pytest
 
 from simple.engines.mujoco import MujocoSimulator
 from simple.sensors import CameraCfg, StereoCameraCfg
+from simple.tasks.arena_eval_camera import configure_arena_eval_cameras
 from simple.tasks.g1_fullstate_arena_football import G1FullstateArenaFootball
 
 
 def _uninitialized_task() -> G1FullstateArenaFootball:
     return object.__new__(G1FullstateArenaFootball)
+
+
+def test_offscreen_framebuffer_fits_policy_and_wide_video_cameras() -> None:
+    model = SimpleNamespace(
+        vis=SimpleNamespace(
+            global_=SimpleNamespace(offwidth=640, offheight=480)
+        )
+    )
+    cameras = {
+        "front_camera": SimpleNamespace(resolution=(640, 480)),
+        "video_camera": SimpleNamespace(resolution=(1280, 720)),
+    }
+
+    MujocoSimulator._fit_offscreen_framebuffer(model, cameras)
+
+    assert model.vis.global_.offwidth == 1280
+    assert model.vis.global_.offheight == 720
 
 
 def _write_robot_recording(
@@ -106,6 +124,30 @@ def test_football_uses_one_arena_aligned_policy_camera() -> None:
     assert G1FullstateArenaFootball.metadata["video_camera_keys"] == (
         "front_camera",
     )
+
+
+def test_football_wide_video_camera_preserves_policy_camera_and_vertical_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARENA_AUX_VIDEO_ENABLED", "1")
+    task = _uninitialized_task()
+    configure_arena_eval_cameras(task)
+
+    policy_camera = task.sensor_cfgs["front_camera"]
+    video_camera = task.sensor_cfgs["video_camera"]
+    assert policy_camera.resolution == (640, 480)
+    assert np.rad2deg(policy_camera.fov) == pytest.approx(105.53033203685067)
+    assert video_camera.resolution == (1280, 720)
+    assert np.rad2deg(video_camera.fov) == pytest.approx(120.63371964175342)
+    assert video_camera.pose == policy_camera.pose
+    assert task.metadata["video_camera_keys"] == ("video_camera",)
+
+    policy_vertical_aperture = 20.0 * 480.0 / 640.0
+    video_horizontal_aperture = (
+        2.0 * video_camera.focal_length * np.tan(video_camera.fov / 2.0)
+    )
+    video_vertical_aperture = video_horizontal_aperture * 720.0 / 1280.0
+    assert video_vertical_aperture == pytest.approx(policy_vertical_aperture)
 
 
 def test_grass_texture_scale_matches_arena() -> None:

@@ -12,6 +12,10 @@ import numpy as np
 from simple.core.layout import Layout
 from simple.core.types import Pose
 from simple.sensors import CameraCfg
+from simple.tasks.arena_eval_camera import (
+    add_arena_eval_cameras,
+    configure_arena_eval_cameras,
+)
 from simple.tasks.g1_fullstate_20260615_task1 import G1Fullstate20260615Task1
 from simple.tasks.registry import TaskRegistry
 
@@ -79,6 +83,10 @@ class G1FullstateArenaOpenDoor(G1Fullstate20260615Task1):
     # interprets it as world-camera axes and converts it a second time.
     isaac_camera_axes = "usd"
     mujoco_native_head_camera = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        configure_arena_eval_cameras(self)
 
     _default_root_pos = np.asarray([-1.6, 0.2, 0.8], dtype=np.float64)
     _default_root_quat = np.asarray([0.70711, 0.0, 0.0, 0.70711], dtype=np.float64)
@@ -230,7 +238,7 @@ class G1FullstateArenaOpenDoor(G1Fullstate20260615Task1):
     def _arena_asset_paths(cls) -> dict[str, Path]:
         override = os.environ.get("HUMANOID_ARENA_ISAAC_ASSET_ROOT")
         candidates = [Path(override)] if override else []
-        candidates.extend([cls._arena_repo_root / "assets", cls._arena_repo_root / "assets1"])
+        candidates.append(cls._arena_repo_root / "assets")
         relative_scene = Path("objects/small_warehouse/small_warehouse_opendoor")
         for root in candidates:
             scene = root / relative_scene
@@ -273,6 +281,11 @@ class G1FullstateArenaOpenDoor(G1Fullstate20260615Task1):
                     "E_leaf_2": self._leaf_body,
                     "E_handle_4": self._handle_body,
                 },
+                # The referenced asset authors scale=(1.2, 1.0, 0.78) on its
+                # root.  Synchronize articulated children in that pre-scale
+                # local frame so rotations do not acquire shear/visual shrink.
+                "sync_subprims_pose_space": "root_local_scaled",
+                "sync_root_scale": [1.2, 1.0, 0.78],
                 "disable_collision": True,
                 "required": required,
             },
@@ -356,9 +369,7 @@ class G1FullstateArenaOpenDoor(G1Fullstate20260615Task1):
         self._arena_open_door_start_pos = door_pos.copy()
         self._arena_open_door_start_quat = door_quat.copy()
 
-        self._layout.add_camera(
-            "front_camera", copy.deepcopy(self.sensor_cfgs["front_camera"])
-        )
+        add_arena_eval_cameras(self)
         instruction = "Press the door handle down and open the door."
         if self._env_flag("ARENA_OPEN_DOOR_ALLOW_INSTRUCTION_OVERRIDE", False):
             instruction = os.environ.get("ARENA_OPEN_DOOR_INSTRUCTION", instruction)

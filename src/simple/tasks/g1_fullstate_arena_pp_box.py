@@ -180,10 +180,7 @@ class G1FullstateArenaPPBox(G1Fullstate20260615Task1):
         )
         if raw:
             return Path(raw)
-        for candidate in (cls._arena_repo_root / "assets1", cls._arena_repo_root / "assets"):
-            if candidate.exists():
-                return candidate
-        return cls._arena_repo_root / "assets1"
+        return cls._arena_repo_root / "assets"
 
     @classmethod
     def _arena_isaac_asset_paths(cls) -> dict[str, Path]:

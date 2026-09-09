@@ -76,6 +76,28 @@ class MujocoSimulator(Simulator):
         self._is_sonic = ("sonic_config" in kwargs)
         self._setup_scene(**kwargs)
 
+    @staticmethod
+    def _fit_offscreen_framebuffer(model, cameras) -> None:
+        """Grow MuJoCo's shared offscreen buffer for every configured camera.
+
+        ``mujoco.Renderer`` rejects a camera resolution larger than
+        ``model.vis.global_.offwidth/offheight``.  Arena evaluations use a
+        640x480 policy camera and may additionally use a 1280x720 recording
+        camera, so size the shared framebuffer from the largest dimensions
+        before constructing either renderer.
+        """
+        resolutions = [camera.resolution for camera in cameras.values()]
+        if not resolutions:
+            return
+        required_width = max(int(resolution[0]) for resolution in resolutions)
+        required_height = max(int(resolution[1]) for resolution in resolutions)
+        model.vis.global_.offwidth = max(
+            int(model.vis.global_.offwidth), required_width
+        )
+        model.vis.global_.offheight = max(
+            int(model.vis.global_.offheight), required_height
+        )
+
     def step(self, render=True, render_robot_mask=False, **kwargs) -> Dict[str, np.ndarray] | None:
         before_step = getattr(self.task, "before_mujoco_step", None)
         if before_step is not None:
@@ -388,6 +410,7 @@ class MujocoSimulator(Simulator):
             self.close()
 
         self.renderers = {}
+        self._fit_offscreen_framebuffer(self.mjModel, self.task.layout.cameras)
         for cname, camera in self.task.layout.cameras.items():
             self.renderers[cname] = mujoco.Renderer(
                 self.mjModel,

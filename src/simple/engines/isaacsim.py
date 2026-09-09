@@ -44,6 +44,7 @@ from simple.core.simulator import Simulator
 from simple.core.task import Task
 from simple.scenes.hssd import HssdSuite
 from simple.utils import env_flag, resolve_data_path
+from simple.task_visuals import world_pose_to_scaled_root_local_matrix
 
 # import isaacsim
 
@@ -755,6 +756,10 @@ class IsaacSimSimulator(Simulator):
             "prim_path": prim_path,
             "sync_body": spec.get("sync_body"),
             "sync_subprims": dict(spec.get("sync_subprims", {})),
+            "sync_subprims_pose_space": spec.get(
+                "sync_subprims_pose_space", "world"
+            ),
+            "sync_root_scale": spec.get("sync_root_scale"),
         }
 
     def __create_task_primitive_visual(self, spec: dict) -> None:
@@ -787,6 +792,10 @@ class IsaacSimSimulator(Simulator):
             "prim_path": prim_path,
             "sync_body": spec.get("sync_body"),
             "sync_subprims": dict(spec.get("sync_subprims", {})),
+            "sync_subprims_pose_space": spec.get(
+                "sync_subprims_pose_space", "world"
+            ),
+            "sync_root_scale": spec.get("sync_root_scale"),
         }
 
     def __apply_task_primitive_material(self, prim_path: str, spec: dict) -> None:
@@ -871,8 +880,9 @@ class IsaacSimSimulator(Simulator):
     def __sync_task_visuals(self, synced_pose_by_name: dict[str, tuple]) -> None:
         for visual in getattr(self, "task_visuals", {}).values():
             sync_body = visual.get("sync_body")
+            root_pose = synced_pose_by_name.get(sync_body)
             if sync_body in synced_pose_by_name:
-                obj_pos, obj_ori = synced_pose_by_name[sync_body]
+                obj_pos, obj_ori = root_pose
                 XFormPrim(prim_path=visual["prim_path"]).set_local_pose(
                     translation=obj_pos,
                     orientation=obj_ori,
@@ -889,10 +899,39 @@ class IsaacSimSimulator(Simulator):
                         print(f"[IsaacTaskVisual] missing sync subprim: {subprim_path}")
                         self._missing_task_visual_paths.add(key)
                     continue
-                XFormPrim(prim_path=subprim_path).set_world_pose(
-                    position=obj_pos,
-                    orientation=obj_ori,
-                )
+                pose_space = visual.get("sync_subprims_pose_space", "world")
+                if pose_space == "root_local_scaled":
+                    if root_pose is None or visual.get("sync_root_scale") is None:
+                        raise ValueError(
+                            "root_local_scaled task visual sync requires a published "
+                            "sync_body pose and sync_root_scale"
+                        )
+                    root_pos, root_ori = root_pose
+                    local_matrix = world_pose_to_scaled_root_local_matrix(
+                        obj_pos,
+                        obj_ori,
+                        root_pos,
+                        root_ori,
+                        visual["sync_root_scale"],
+                    )
+                    # Translation/quaternion/scale decomposition is not exact
+                    # below a non-uniformly scaled parent once the child
+                    # rotates.  Author the compensating matrix directly so
+                    # door leaves and handles remain rigid instead of shearing
+                    # or sinking into one another.
+                    matrix_op = UsdGeom.Xformable(prim).MakeMatrixXform()
+                    matrix_op.Set(
+                        Gf.Matrix4d(*local_matrix.reshape(-1).tolist())
+                    )
+                elif pose_space == "world":
+                    XFormPrim(prim_path=subprim_path).set_world_pose(
+                        position=obj_pos,
+                        orientation=obj_ori,
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported task visual sync pose space: {pose_space!r}"
+                    )
 
     def __reset_objects(self):
         # from omni.isaac.core.utils.prims import delete_prim

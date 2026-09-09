@@ -13,6 +13,10 @@ import numpy as np
 from simple.core.layout import Layout
 from simple.core.types import Pose
 from simple.sensors import CameraCfg
+from simple.tasks.arena_eval_camera import (
+    add_arena_eval_cameras,
+    configure_arena_eval_cameras,
+)
 from simple.tasks.g1_fullstate_20260615_task1 import G1Fullstate20260615Task1
 from simple.tasks.registry import TaskRegistry
 
@@ -151,6 +155,10 @@ class G1FullstateArenaFootball(G1Fullstate20260615Task1):
     isaac_camera_axes = "usd"
     mujoco_native_head_camera = True
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        configure_arena_eval_cameras(self)
+
     # HumanoidArena single-goal football geometry:
     # robot root [0, -2, 0.8], yaw +90 deg; goal origin [-2.5, 3.0].
     _default_root_pos = np.asarray([0.0, -2.0, 0.8], dtype=np.float64)
@@ -288,10 +296,7 @@ class G1FullstateArenaFootball(G1Fullstate20260615Task1):
         if raw:
             return Path(raw)
 
-        for candidate in (cls._arena_repo_root / "assets1", cls._arena_repo_root / "assets"):
-            if candidate.exists():
-                return candidate
-        return cls._arena_repo_root / "assets1"
+        return cls._arena_repo_root / "assets"
 
     @classmethod
     def _arena_isaac_asset_paths(cls) -> dict[str, Path]:
@@ -667,8 +672,7 @@ class G1FullstateArenaFootball(G1Fullstate20260615Task1):
         self.mujoco_extra_mjcf[0]["pos"] = ball_pos.tolist()
         self.mujoco_extra_mjcf[0]["quat"] = ball_quat
 
-        camera_cfg = copy.deepcopy(self.sensor_cfgs["front_camera"])
-        self._layout.add_camera("front_camera", camera_cfg)
+        add_arena_eval_cameras(self)
 
         instruction = "Kick the football into the goal."
         if os.environ.get("ARENA_FOOTBALL_ALLOW_INSTRUCTION_OVERRIDE", "0") == "1":

@@ -5,8 +5,14 @@ from pathlib import Path
 import mujoco
 import numpy as np
 import pytest
+import transforms3d as t3d
 
 from simple.sensors import CameraCfg, StereoCameraCfg
+from simple.task_visuals import (
+    world_pose_to_scaled_root_local,
+    world_pose_to_scaled_root_local_matrix,
+)
+from simple.tasks.arena_eval_camera import configure_arena_eval_cameras
 from simple.tasks.g1_fullstate_arena_open_door import G1FullstateArenaOpenDoor
 
 
@@ -41,6 +47,19 @@ def test_open_door_uses_arena_front_camera() -> None:
     assert G1FullstateArenaOpenDoor.metadata["video_camera_keys"] == (
         "front_camera",
     )
+
+
+def test_open_door_wide_video_camera_does_not_replace_policy_camera(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARENA_AUX_VIDEO_ENABLED", "1")
+    task = _uninitialized_task()
+    configure_arena_eval_cameras(task)
+
+    assert task.sensor_cfgs["front_camera"].resolution == (640, 480)
+    assert task.sensor_cfgs["video_camera"].resolution == (1280, 720)
+    assert task.sensor_cfgs["video_camera"].pose == task.sensor_cfgs["front_camera"].pose
+    assert task.metadata["video_camera_keys"] == ("video_camera",)
 
 
 def test_door_mjcf_contains_collidable_leaf_handle_and_frame() -> None:
@@ -238,7 +257,134 @@ def test_usd_visuals_are_read_only_and_track_all_door_bodies() -> None:
         "E_leaf_2": task._leaf_body,
         "E_handle_4": task._handle_body,
     }
+    assert door["sync_subprims_pose_space"] == "root_local_scaled"
+    assert door["sync_root_scale"] == pytest.approx([1.2, 1.0, 0.78])
     assert task.metadata["isaac_read_only_mirror"] is True
+
+
+def test_scaled_root_local_sync_recovers_authored_door_body_pose() -> None:
+    root_position = np.asarray([-1.614, 2.314, 0.002])
+    root_orientation = t3d.euler.euler2quat(0.1, -0.2, 0.35)
+    root_scale = np.asarray([1.2, 1.0, 0.78])
+    authored_position = np.asarray([0.32068946, -0.10198606, 1.15700055])
+    authored_orientation = t3d.euler.euler2quat(0.0, np.pi, -0.4)
+
+    root_rotation = t3d.quaternions.quat2mat(root_orientation)
+    body_position = root_position + root_rotation @ (root_scale * authored_position)
+    body_orientation = t3d.quaternions.qmult(
+        root_orientation, authored_orientation
+    )
+    local_position, local_orientation = world_pose_to_scaled_root_local(
+        body_position,
+        body_orientation,
+        root_position,
+        root_orientation,
+        root_scale,
+    )
+
+    np.testing.assert_allclose(local_position, authored_position, atol=1.0e-12)
+    # q and -q encode the same rotation.
+    assert abs(float(np.dot(local_orientation, authored_orientation))) == pytest.approx(
+        1.0, abs=1.0e-12
+    )
+
+
+def test_scaled_root_local_matrix_exactly_preserves_rotated_rigid_geometry() -> None:
+    root_position = np.asarray([-1.614, 2.314, 0.002])
+    root_orientation = t3d.euler.euler2quat(0.0, 0.0, 0.31)
+    root_scale = np.asarray([1.2, 1.0, 0.78])
+    body_position = np.asarray([-0.9, 2.7, 0.82])
+    body_orientation = t3d.euler.euler2quat(0.2, -0.4, 1.1)
+
+    local = world_pose_to_scaled_root_local_matrix(
+        body_position,
+        body_orientation,
+        root_position,
+        root_orientation,
+        root_scale,
+    )
+
+    def scaled_world(position: np.ndarray, orientation: np.ndarray) -> np.ndarray:
+        matrix = np.eye(4)
+        matrix[:3, :3] = np.diag(root_scale) @ t3d.quaternions.quat2mat(
+            orientation
+        ).T
+        matrix[3, :3] = position
+        return matrix
+
+    root_world = scaled_world(root_position, root_orientation)
+    expected_body_world = scaled_world(body_position, body_orientation)
+    np.testing.assert_allclose(local @ root_world, expected_body_world, atol=1.0e-12)
+
+
+@pytest.mark.parametrize("leaf_deg", [0.0, 30.0, 60.0, 90.0])
+@pytest.mark.parametrize("handle_deg", [0.0, -20.0, -36.0])
+def test_door_pose_sweep_keeps_handle_pivot_attached(
+    leaf_deg: float, handle_deg: float
+) -> None:
+    model, data = _compiled_door()
+    leaf_joint_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_JOINT, G1FullstateArenaOpenDoor._leaf_joint
+    )
+    handle_joint_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_JOINT, G1FullstateArenaOpenDoor._handle_joint
+    )
+    leaf_qpos_adr = int(model.jnt_qposadr[leaf_joint_id])
+    handle_qpos_adr = int(model.jnt_qposadr[handle_joint_id])
+    data.qpos[leaf_qpos_adr] = np.deg2rad(leaf_deg)
+    data.qpos[handle_qpos_adr] = np.deg2rad(handle_deg)
+    mujoco.mj_forward(model, data)
+
+    root_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, G1FullstateArenaOpenDoor._door_root_body
+    )
+    leaf_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, G1FullstateArenaOpenDoor._leaf_body
+    )
+    handle_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, G1FullstateArenaOpenDoor._handle_body
+    )
+    scale = np.asarray([1.2, 1.0, 0.78])
+
+    local_positions = []
+    for body_id in (leaf_id, handle_id):
+        local_position, local_orientation = world_pose_to_scaled_root_local(
+            data.xpos[body_id],
+            data.xquat[body_id],
+            data.xpos[root_id],
+            data.xquat[root_id],
+            scale,
+        )
+        assert np.isfinite(local_position).all()
+        assert np.isfinite(local_orientation).all()
+        assert np.linalg.norm(local_orientation) == pytest.approx(1.0)
+        local_positions.append(local_position)
+
+        local_matrix = world_pose_to_scaled_root_local_matrix(
+            data.xpos[body_id],
+            data.xquat[body_id],
+            data.xpos[root_id],
+            data.xquat[root_id],
+            scale,
+        )
+        root_world = np.eye(4)
+        root_world[:3, :3] = np.diag(scale) @ t3d.quaternions.quat2mat(
+            data.xquat[root_id]
+        ).T
+        root_world[3, :3] = data.xpos[root_id]
+        expected_world = np.eye(4)
+        expected_world[:3, :3] = np.diag(scale) @ t3d.quaternions.quat2mat(
+            data.xquat[body_id]
+        ).T
+        expected_world[3, :3] = data.xpos[body_id]
+        np.testing.assert_allclose(local_matrix @ root_world, expected_world, atol=1e-9)
+
+    # Handle rotation is about its own pivot, so the handle body origin must
+    # remain rigidly attached to the leaf for every leaf/handle angle pair.
+    scaled_pivot_offset = scale * (local_positions[1] - local_positions[0])
+    assert np.linalg.norm(scaled_pivot_offset) == pytest.approx(
+        np.linalg.norm(model.body_pos[handle_id]), abs=1.0e-9
+    )
 
 
 def test_recording_loader_reads_episode_initial_door_pose(tmp_path: Path) -> None:
